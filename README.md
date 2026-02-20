@@ -6,36 +6,39 @@ Tech stack:
 - Global registry in `~/.context-agent/registry.db` (override with `CTX_HOME`)
 - MCP stdio server for Cursor/Claude integration
 
-## Install (global command `ctx`)
+## Install globally (from GitHub)
 
-One-command installer:
-- `bash /absolute/path/to/context_store/install.sh`
-
-Recommended:
+Install `ctx` globally so it works in any repo:
 - `python3 -m pip install --user pipx`
 - `python3 -m pipx ensurepath`
-- `pipx install /absolute/path/to/context_store`
+- `pipx install git+https://github.com/RahimMirani/code-context.git`
 
 Upgrade:
-- `python3 -m pipx install --force /absolute/path/to/context_store`
+- `pipx install --force git+https://github.com/RahimMirani/code-context.git`
 
 Check install:
 - `which ctx`
 - `ctx --help`
 
-## First-time setup in any repo
+## Configure in a project (minimal workflow)
 
-From the repo root you want to track:
+In the project you want to record:
 - `ctx init`
 - `ctx start`
 
-If upgrading from older hook format:
-- `ctx init --force`
+When you want to stop recording:
+- `ctx stop`
 
-`ctx init` does:
-- writes `.cursor/mcp.json` with `ctx-memory` server
-- writes `.claude/settings.local.json` with `ctx-memory` + Claude hooks
-- ensures `.context-memory/` exists in `.gitignore`
+Resume an older session:
+- `ctx resume --session-id <number>`
+
+Delete a session:
+- `ctx delete --session-id <number>`
+
+What `ctx init` configures:
+- `.cursor/mcp.json`
+- `.claude/settings.local.json`
+- `.gitignore` entry for `.context-memory/`
 
 ## Command reference
 
