@@ -433,6 +433,8 @@ def _merge_config_and_heartbeat(config_status: str, config_detail: str, heartbea
         return ("connected", f"{hb_detail} (last={hb_ts})")
     if hb_status == "available":
         return ("degraded", f"stale heartbeat (last={hb_ts})")
+    if hb_status == "unknown":
+        return ("degraded", hb_detail or f"{label} awaiting heartbeat")
     if hb_status == "degraded":
         return ("degraded", hb_detail or f"{label} degraded")
     return ("unavailable", hb_detail or f"{label} unavailable")
@@ -693,4 +695,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
