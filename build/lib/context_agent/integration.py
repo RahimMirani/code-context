@@ -23,14 +23,16 @@ def _legacy_hook_command(project: Path, event: str) -> str:
 
 
 def _is_ctx_hook_command(value: str, project: Path, event: str) -> bool:
-    return value in {_hook_command(project, event), _legacy_hook_command(project, event)}
+    if value in {_hook_command(project, event), _legacy_hook_command(project, event)}:
+        return True
+    return "ctx hook ingest --project-path" in value and f"--event {event}" in value
 
 
 def _ctx_hook_entry(project: Path, event: str) -> dict:
     command = _hook_command(project, event)
     if event in {"PreToolUse", "PostToolUse"}:
         return {
-            "matcher": {"tools": ["*"]},
+            "matcher": "*",
             "hooks": [{"type": "command", "command": command}],
         }
     return {
@@ -41,6 +43,14 @@ def _ctx_hook_entry(project: Path, event: str) -> dict:
 def _entry_contains_ctx_hook(entry: object, project: Path, event: str) -> bool:
     if not isinstance(entry, dict):
         return False
+    # Legacy invalid format:
+    # {"type":"command","command":"ctx hook ingest ..."}
+    if (
+        entry.get("type") == "command"
+        and isinstance(entry.get("command"), str)
+        and _is_ctx_hook_command(entry.get("command"), project, event)
+    ):
+        return True
     hooks = entry.get("hooks")
     if not isinstance(hooks, list):
         return False
