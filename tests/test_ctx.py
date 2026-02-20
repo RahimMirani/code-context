@@ -27,7 +27,7 @@ class CtxIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.tempdir.cleanup()
 
-    def run_ctx(self, args: list[str], expected: int = 0):
+    def run_ctx(self, args: list[str], expected: int = 0, input_text: str | None = None):
         cmd = [sys.executable, "-m", "context_agent.cli"] + args
         result = subprocess.run(
             cmd,
@@ -35,6 +35,7 @@ class CtxIntegrationTests(unittest.TestCase):
             env=self.env,
             capture_output=True,
             text=True,
+            input=input_text,
         )
         if result.returncode != expected:
             raise AssertionError(
@@ -42,6 +43,42 @@ class CtxIntegrationTests(unittest.TestCase):
                 f"code={result.returncode}\nstdout={result.stdout}\nstderr={result.stderr}"
             )
         return result
+
+    def _mcp_write(self, proc: subprocess.Popen, payload: dict) -> None:
+        encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        proc.stdin.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii") + encoded)
+        proc.stdin.flush()
+
+    def _mcp_read(self, proc: subprocess.Popen) -> dict:
+        header = b""
+        while b"\r\n\r\n" not in header:
+            chunk = proc.stdout.read(1)
+            if not chunk:
+                raise AssertionError("MCP server closed stdout unexpectedly")
+            header += chunk
+        header_text = header.decode("ascii", errors="ignore")
+        length = None
+        for line in header_text.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                length = int(line.split(":", 1)[1].strip())
+                break
+        if length is None:
+            raise AssertionError(f"Missing Content-Length header: {header_text}")
+        body = proc.stdout.read(length)
+        if not body:
+            raise AssertionError("Missing MCP response body")
+        return json.loads(body.decode("utf-8"))
+
+    def _mcp_request(self, proc: subprocess.Popen, request_id: int, method: str, params: dict | None = None) -> dict:
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        self._mcp_write(proc, payload)
+        response = self._mcp_read(proc)
+        self.assertEqual(response.get("id"), request_id)
+        if "error" in response:
+            raise AssertionError(f"MCP error: {response['error']}")
+        return response
 
     def test_start_stop_where_status_delete_purge(self):
         out = self.run_ctx(["start", "--path", str(self.project), "--name", "demo", "--agent", "auto"])
@@ -95,11 +132,10 @@ class CtxIntegrationTests(unittest.TestCase):
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
 
-        time.sleep(3.5)
+        time.sleep(1.5)
         self.run_ctx(["stop", "--path", str(self.project)])
 
         db_path = self.project / ".context-memory" / "context.db"
-        self.assertTrue(db_path.exists())
         with sqlite3.connect(db_path) as conn:
             event = conn.execute(
                 "SELECT event_type, summary FROM events WHERE event_type = 'decision_made' ORDER BY id DESC LIMIT 1"
@@ -116,12 +152,12 @@ class CtxIntegrationTests(unittest.TestCase):
         tracked = self.project / "tracked.txt"
         tracked.write_text("v1", encoding="utf-8")
         self.run_ctx(["start", "--path", str(self.project), "--name", "revert-demo", "--agent", "auto"])
-        time.sleep(1.0)
+        time.sleep(0.8)
 
         tracked.write_text("v2", encoding="utf-8")
-        time.sleep(1.0)
+        time.sleep(0.8)
         tracked.write_text("v1", encoding="utf-8")
-        time.sleep(1.0)
+        time.sleep(0.8)
 
         self.run_ctx(["stop", "--path", str(self.project)])
 
@@ -141,6 +177,143 @@ class CtxIntegrationTests(unittest.TestCase):
 
         status = self.run_ctx(["status", "--path", str(self.project)])
         self.assertIn("Last revert:", status.stdout)
+
+    def test_init_writes_project_local_configs_and_gitignore(self):
+        cursor_dir = self.project / ".cursor"
+        cursor_dir.mkdir(parents=True, exist_ok=True)
+        (cursor_dir / "mcp.json").write_text(
+            json.dumps({"mcpServers": {"other": {"command": "other"}}, "custom": True}),
+            encoding="utf-8",
+        )
+        claude_dir = self.project / ".claude"
+        claude_dir.mkdir(parents=True, exist_ok=True)
+        (claude_dir / "settings.local.json").write_text(
+            json.dumps({"mcpServers": {"other": {"command": "other"}}, "hooks": {"Foo": []}, "custom": 1}),
+            encoding="utf-8",
+        )
+
+        out = self.run_ctx(["init", "--path", str(self.project)])
+        self.assertIn("Initialized project integration", out.stdout)
+
+        cursor_cfg = json.loads((self.project / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
+        self.assertTrue(cursor_cfg.get("custom"))
+        self.assertIn("ctx-memory", cursor_cfg.get("mcpServers", {}))
+        self.assertIn("other", cursor_cfg.get("mcpServers", {}))
+
+        claude_cfg = json.loads((self.project / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+        self.assertEqual(claude_cfg.get("custom"), 1)
+        self.assertIn("ctx-memory", claude_cfg.get("mcpServers", {}))
+        self.assertIn("hooks", claude_cfg)
+        self.assertIn("UserPromptSubmit", claude_cfg["hooks"])
+        self.assertIn("PreToolUse", claude_cfg["hooks"])
+        self.assertIn("PostToolUse", claude_cfg["hooks"])
+        self.assertIn("Stop", claude_cfg["hooks"])
+        self.assertIn(".context-memory/", (self.project / ".gitignore").read_text(encoding="utf-8"))
+
+    def test_mcp_server_append_event_and_doctor(self):
+        self.run_ctx(["init", "--path", str(self.project)])
+        self.run_ctx(["start", "--path", str(self.project), "--name", "mcp-demo", "--agent", "auto"])
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "context_agent.cli", "mcp", "serve", "--project-path", str(self.project)],
+            cwd=ROOT,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            init_resp = self._mcp_request(proc, 1, "initialize", {"clientInfo": {"name": "test", "version": "1"}})
+            self.assertIn("result", init_resp)
+
+            tools_resp = self._mcp_request(proc, 2, "tools/list", {})
+            tools = tools_resp["result"]["tools"]
+            tool_names = {tool["name"] for tool in tools}
+            self.assertIn("append_event", tool_names)
+            self.assertIn("get_context", tool_names)
+
+            self._mcp_request(
+                proc,
+                3,
+                "tools/call",
+                {"name": "ping", "arguments": {"client": "cursor"}},
+            )
+            self._mcp_request(
+                proc,
+                4,
+                "tools/call",
+                {
+                    "name": "append_event",
+                    "arguments": {
+                        "client": "cursor",
+                        "event_type": "decision_made",
+                        "summary": "Use MCP tool events for continuity.",
+                        "files_touched": ["src/a.py"],
+                        "decision": True,
+                    },
+                },
+            )
+            context_resp = self._mcp_request(
+                proc,
+                5,
+                "tools/call",
+                {"name": "get_context", "arguments": {"max_events": 5}},
+            )
+            content_blob = context_resp["result"]["content"][0]["text"]
+            parsed = json.loads(content_blob)
+            self.assertEqual(Path(parsed["project"]).resolve(), self.project.resolve())
+            self.assertGreaterEqual(len(parsed["recent_events"]), 1)
+        finally:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.terminate()
+            proc.wait(timeout=5)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+        doctor = self.run_ctx(["doctor", "--path", str(self.project), "--json"])
+        payload = json.loads(doctor.stdout)
+        self.assertIn("checks", payload)
+        self.assertIn("cursor_mcp", payload["checks"])
+        self.assertIn(payload["checks"]["cursor_mcp"]["status"], {"connected", "degraded", "unavailable"})
+
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+    def test_hook_ingest_records_summary_only_event(self):
+        self.run_ctx(["init", "--path", str(self.project)])
+        self.run_ctx(["start", "--path", str(self.project), "--name", "hook-demo", "--agent", "auto"])
+        hook_payload = {
+            "summary": "User asked to refactor auth middleware.",
+            "files_touched": ["src/auth.py"],
+            "raw_prompt": "this must not be stored",
+        }
+        out = self.run_ctx(
+            [
+                "hook",
+                "ingest",
+                "--project-path",
+                str(self.project),
+                "--event",
+                "UserPromptSubmit",
+            ],
+            input_text=json.dumps(hook_payload),
+        )
+        self.assertIn("Hook event ingested", out.stdout)
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+        db_path = self.project / ".context-memory" / "context.db"
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT event_type, source, summary FROM events WHERE source = 'hook:claude' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertEqual(row[0], "user_intent")
+            self.assertEqual(row[1], "hook:claude")
+            self.assertIn("refactor auth middleware", row[2].lower())
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(events)").fetchall()}
+            self.assertNotIn("raw_prompt", cols)
 
 
 if __name__ == "__main__":
