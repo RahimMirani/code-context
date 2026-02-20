@@ -407,6 +407,22 @@ def cmd_delete(args) -> int:
     if not row:
         print(f"Project not found: {project_path}")
         return 1
+    if args.session_id is not None:
+        if row["recording_state"] == "recording":
+            print("Stop recording before deleting a session.")
+            return 1
+        store = ProjectStore(project_path)
+        try:
+            deleted = store.delete_session(int(args.session_id))
+        except RuntimeError as exc:
+            print(str(exc))
+            return 1
+        if not deleted:
+            print(f"Session not found: {args.session_id}")
+            return 1
+        print(f"Deleted session {args.session_id} in project: {project_path}")
+        return 0
+
     if row["recording_state"] == "recording":
         print("Stop recording before delete.")
         return 1
@@ -715,6 +731,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_delete = subparsers.add_parser("delete", help="Soft delete project context")
     p_delete.add_argument("--path", default=None)
     p_delete.add_argument("--name", default=None)
+    p_delete.add_argument("--session-id", default=None, type=int)
     p_delete.set_defaults(func=cmd_delete)
 
     p_purge = subparsers.add_parser("purge", help="Permanently delete project context")
