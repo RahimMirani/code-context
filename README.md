@@ -25,6 +25,9 @@ Inside the repo you want to track:
 - `ctx init`
 - `ctx start`
 
+If you upgraded from an older version that wrote legacy Claude hook format, run:
+- `ctx init --force`
+
 `ctx init` does:
 - writes `.cursor/mcp.json` with `ctx-memory` MCP server
 - writes `.claude/settings.local.json` with `ctx-memory` MCP + Claude hook commands
@@ -59,4 +62,3 @@ If you want file-based ingestion fallback:
 - Revert tracking via file-hash state
 - Soft delete + purge
 - Shared memory across sessions/models for same repo
-
