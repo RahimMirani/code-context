@@ -80,6 +80,21 @@ class CtxIntegrationTests(unittest.TestCase):
             raise AssertionError(f"MCP error: {response['error']}")
         return response
 
+    def _mcp_request_jsonl(self, proc: subprocess.Popen, request_id: int, method: str, params: dict | None = None) -> dict:
+        payload = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        proc.stdin.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True) + "\n")
+        proc.stdin.flush()
+        line = proc.stdout.readline()
+        if not line:
+            raise AssertionError("MCP server closed stdout unexpectedly (jsonl)")
+        response = json.loads(line)
+        self.assertEqual(response.get("id"), request_id)
+        if "error" in response:
+            raise AssertionError(f"MCP error (jsonl): {response['error']}")
+        return response
+
     def test_start_stop_where_status_delete_purge(self):
         out = self.run_ctx(["start", "--path", str(self.project), "--name", "demo", "--agent", "auto"])
         self.assertIn("Recording started.", out.stdout)
@@ -368,6 +383,44 @@ class CtxIntegrationTests(unittest.TestCase):
         self.assertIn("checks", payload)
         self.assertIn("cursor_mcp", payload["checks"])
         self.assertIn(payload["checks"]["cursor_mcp"]["status"], {"connected", "degraded", "unavailable"})
+
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+    def test_mcp_server_jsonl_transport(self):
+        self.run_ctx(["init", "--path", str(self.project)])
+        self.run_ctx(["start", "--path", str(self.project), "--name", "mcp-jsonl", "--agent", "auto"])
+
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "context_agent.cli", "mcp", "serve", "--project-path", str(self.project)],
+            cwd=ROOT,
+            env=self.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            init_resp = self._mcp_request_jsonl(proc, 1, "initialize", {"clientInfo": {"name": "cursor", "version": "1"}})
+            self.assertIn("result", init_resp)
+            ping_resp = self._mcp_request_jsonl(
+                proc,
+                2,
+                "tools/call",
+                {"name": "ping", "arguments": {"client": "cursor"}},
+            )
+            blob = ping_resp["result"]["content"][0]["text"]
+            parsed = json.loads(blob)
+            self.assertTrue(parsed["pong"])
+            self.assertEqual(parsed["client"], "cursor")
+        finally:
+            if proc.stdin:
+                proc.stdin.close()
+            proc.terminate()
+            proc.wait(timeout=5)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
 
         self.run_ctx(["stop", "--path", str(self.project)])
 
