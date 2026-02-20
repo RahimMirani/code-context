@@ -73,6 +73,21 @@ def _atomic_write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
+def _resolve_ctx_command() -> str:
+    resolved = shutil.which("ctx")
+    if resolved:
+        return str(Path(resolved).resolve())
+    return "ctx"
+
+
+def _is_valid_ctx_command(command: object) -> bool:
+    if not isinstance(command, str) or not command:
+        return False
+    if command == "ctx":
+        return True
+    return Path(command).name in {"ctx", "ctx.exe"}
+
+
 def _read_json(path: Path, force: bool) -> dict:
     if not path.exists():
         return {}
@@ -115,8 +130,9 @@ def update_cursor_mcp_config(project_path: Path, force: bool = False) -> Path:
         mcp_servers = {}
         payload["mcpServers"] = mcp_servers
 
+    ctx_command = _resolve_ctx_command()
     mcp_servers[CTX_SERVER_NAME] = {
-        "command": "ctx",
+        "command": ctx_command,
         "args": ["mcp", "serve", "--project-path", str(project)],
     }
     _atomic_write_json(config_path, payload)
@@ -132,8 +148,9 @@ def update_claude_settings(project_path: Path, force: bool = False) -> Path:
     if not isinstance(mcp_servers, dict):
         mcp_servers = {}
         payload["mcpServers"] = mcp_servers
+    ctx_command = _resolve_ctx_command()
     mcp_servers[CTX_SERVER_NAME] = {
-        "command": "ctx",
+        "command": ctx_command,
         "args": ["mcp", "serve", "--project-path", str(project)],
     }
 
@@ -175,8 +192,8 @@ def inspect_cursor_mcp_config(project_path: Path) -> tuple[str, str]:
     command = server.get("command")
     args = server.get("args")
     expected_arg = str(project)
-    if command != "ctx":
-        return ("degraded", "ctx-memory command is not 'ctx'")
+    if not _is_valid_ctx_command(command):
+        return ("degraded", "ctx-memory command is not a valid ctx executable")
     if not isinstance(args, list) or expected_arg not in [str(x) for x in args]:
         return ("degraded", "ctx-memory args missing project path")
     return ("available", str(path))
@@ -207,8 +224,8 @@ def inspect_claude_settings(project_path: Path) -> tuple[str, str, tuple[str, st
             command = server.get("command")
             args = server.get("args")
             expected_arg = str(project)
-            if command != "ctx":
-                mcp_status = ("degraded", "ctx-memory command is not 'ctx'")
+            if not _is_valid_ctx_command(command):
+                mcp_status = ("degraded", "ctx-memory command is not a valid ctx executable")
             elif not isinstance(args, list) or expected_arg not in [str(x) for x in args]:
                 mcp_status = ("degraded", "ctx-memory args missing project path")
             else:
