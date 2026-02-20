@@ -380,6 +380,23 @@ class ProjectStore:
 
         return self._execute_retry(_read)
 
+    def list_sessions(self, limit: int = 50):
+        safe_limit = max(1, min(int(limit), 500))
+
+        def _read():
+            with self._connect() as conn:
+                return conn.execute(
+                    """
+                    SELECT id, project_id, agent, started_at, stopped_at, state, external_session_ref, last_updated_at
+                    FROM sessions
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+
+        return self._execute_retry(_read)
+
     def set_session_external_ref(self, session_id: int, external_session_ref: str) -> None:
         now = utc_now()
 
@@ -392,6 +409,159 @@ class ProjectStore:
                     WHERE id = ?
                     """,
                     (external_session_ref, now, session_id),
+                )
+
+        self._execute_retry(_write)
+
+    def _decode_files_touched(self, files_json: str | None) -> list[str]:
+        if not files_json:
+            return []
+        try:
+            parsed = json.loads(files_json)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [str(item) for item in parsed if isinstance(item, str)]
+
+    def _rebuild_file_state_from_events(self, conn: sqlite3.Connection) -> None:
+        now = utc_now()
+        conn.execute("DELETE FROM file_state")
+        conn.execute("DELETE FROM file_hash_history")
+        conn.execute(
+            """
+            UPDATE events
+            SET is_effective = 1,
+                reverted_by_event_id = NULL
+            WHERE after_hash IS NOT NULL
+            """
+        )
+
+        rows = conn.execute(
+            """
+            SELECT id, event_type, files_touched_json, after_hash
+            FROM events
+            WHERE after_hash IS NOT NULL
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+        baseline_by_path: dict[str, str] = {}
+        current_by_path: dict[str, str] = {}
+        last_event_by_path: dict[str, int] = {}
+
+        for row in rows:
+            files = self._decode_files_touched(row["files_touched_json"])
+            if len(files) != 1:
+                continue
+            path = files[0]
+            after_hash = row["after_hash"]
+            if not after_hash:
+                continue
+            previous_event_id = last_event_by_path.get(path)
+            if previous_event_id is not None:
+                conn.execute(
+                    "UPDATE events SET is_effective = 0 WHERE id = ?",
+                    (previous_event_id,),
+                )
+                if row["event_type"] == "revert":
+                    conn.execute(
+                        "UPDATE events SET reverted_by_event_id = ? WHERE id = ?",
+                        (int(row["id"]), previous_event_id),
+                    )
+
+            if path not in baseline_by_path:
+                baseline_by_path[path] = str(after_hash)
+            current_by_path[path] = str(after_hash)
+            last_event_by_path[path] = int(row["id"])
+            self._upsert_hash_history(conn, path, str(after_hash), now)
+
+        for path, last_event_id in last_event_by_path.items():
+            baseline = baseline_by_path[path]
+            current = current_by_path[path]
+            conn.execute(
+                """
+                INSERT INTO file_state(path, current_hash, baseline_hash, last_event_id, is_clean, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    current_hash = excluded.current_hash,
+                    baseline_hash = excluded.baseline_hash,
+                    last_event_id = excluded.last_event_id,
+                    is_clean = excluded.is_clean,
+                    updated_at = excluded.updated_at
+                """,
+                (path, current, baseline, last_event_id, 1 if current == baseline else 0, now),
+            )
+
+    def delete_session(self, session_id: int) -> bool:
+        now = utc_now()
+
+        def _delete():
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT id, state FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not row:
+                    return False
+                if row["state"] == "running":
+                    raise RuntimeError("Cannot delete a running session. Stop it first.")
+
+                conn.execute("DELETE FROM tool_usage WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM decisions WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM open_tasks WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM source_status WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM adapter_offsets WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM events WHERE session_id = ?", (session_id,))
+                conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+
+                self._rebuild_file_state_from_events(conn)
+                project_id = self.get_project_id(conn)
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET updated_at = ?, last_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, now, project_id),
+                )
+                used = self._storage_usage()
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET storage_used_bytes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (used, now, project_id),
+                )
+                return True
+
+        return bool(self._execute_retry(_delete))
+
+    def resume_session(self, session_id: int) -> None:
+        now = utc_now()
+
+        def _write():
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET state = 'running',
+                        stopped_at = NULL,
+                        last_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, session_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET recording_state = 'recording',
+                        updated_at = ?,
+                        last_updated_at = ?
+                    WHERE path = ?
+                    """,
+                    (now, now, str(self.project_path)),
                 )
 
         self._execute_retry(_write)
