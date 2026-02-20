@@ -380,6 +380,23 @@ class ProjectStore:
 
         return self._execute_retry(_read)
 
+    def list_sessions(self, limit: int = 50):
+        safe_limit = max(1, min(int(limit), 500))
+
+        def _read():
+            with self._connect() as conn:
+                return conn.execute(
+                    """
+                    SELECT id, project_id, agent, started_at, stopped_at, state, external_session_ref, last_updated_at
+                    FROM sessions
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (safe_limit,),
+                ).fetchall()
+
+        return self._execute_retry(_read)
+
     def set_session_external_ref(self, session_id: int, external_session_ref: str) -> None:
         now = utc_now()
 
@@ -392,6 +409,34 @@ class ProjectStore:
                     WHERE id = ?
                     """,
                     (external_session_ref, now, session_id),
+                )
+
+        self._execute_retry(_write)
+
+    def resume_session(self, session_id: int) -> None:
+        now = utc_now()
+
+        def _write():
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET state = 'running',
+                        stopped_at = NULL,
+                        last_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, session_id),
+                )
+                conn.execute(
+                    """
+                    UPDATE projects
+                    SET recording_state = 'recording',
+                        updated_at = ?,
+                        last_updated_at = ?
+                    WHERE path = ?
+                    """,
+                    (now, now, str(self.project_path)),
                 )
 
         self._execute_retry(_write)
