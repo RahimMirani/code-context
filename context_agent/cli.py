@@ -3,17 +3,28 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .constants import DEFAULT_CAP_BYTES, RECENT_EVENTS_DEFAULT
+from .integration import (
+    ensure_gitignore_entry,
+    inspect_claude_settings,
+    inspect_cursor_mcp_config,
+    resolve_ctx_executable,
+    update_claude_settings,
+    update_cursor_mcp_config,
+)
+from .mcp_server import MCPServer
 from .project_db import ProjectStore, project_memory_paths
 from .recorder import Recorder
 from .registry import Registry
-from .utils import human_bytes, is_pid_alive, normalize_path, terminate_pid, wait_for_process_exit
+from .utils import human_bytes, is_pid_alive, normalize_path, terminate_pid, utc_now, wait_for_process_exit
 
 
 def default_ctx_home() -> Path:
@@ -75,13 +86,85 @@ def spawn_recorder(project_path: Path, session_id: int, agent: str, ctx_home: Pa
     return int(proc.pid)
 
 
+def _set_source_expectations(store: ProjectStore, registry: Registry, session_id: int) -> None:
+    store.update_source_status(session_id, "mcp:cursor", "unknown", "awaiting MCP heartbeat")
+    store.update_source_status(session_id, "mcp:claude", "unknown", "awaiting MCP heartbeat")
+    store.update_source_status(session_id, "hook:claude", "unknown", "awaiting Claude hook event")
+    adapters = registry.get_adapter_configs()
+    if not adapters:
+        store.update_source_status(session_id, "fallback_logs", "unavailable", "no adapter logs configured")
+        return
+    existing = []
+    missing = []
+    for adapter in ("cursor", "claude"):
+        path = adapters.get(adapter)
+        if not path:
+            continue
+        p = normalize_path(path)
+        if p.exists():
+            existing.append(f"{adapter}:{p}")
+        else:
+            missing.append(f"{adapter}:{p}")
+    if existing:
+        detail = f"configured logs={'; '.join(existing)}"
+        if missing:
+            detail += f"; missing={'; '.join(missing)}"
+        store.update_source_status(session_id, "fallback_logs", "available", detail)
+    else:
+        store.update_source_status(session_id, "fallback_logs", "degraded", f"configured but missing: {', '.join(missing)}")
+
+
+def _resolve_runtime_session_id(store: ProjectStore) -> int | None:
+    active = store.get_active_session()
+    if active:
+        return int(active["id"])
+    return None
+
+
+def cmd_init(args) -> int:
+    ctx_home = default_ctx_home()
+    registry = Registry(ctx_home)
+    project_path = resolve_project_path(args, registry)
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    store = ProjectStore(project_path)
+    _memory_root, db_path, logs_path = project_memory_paths(project_path)
+    registry.upsert_project(project_path, getattr(args, "name", None), db_path, logs_path)
+
+    try:
+        cursor_path = update_cursor_mcp_config(project_path, force=bool(args.force))
+        claude_path = update_claude_settings(project_path, force=bool(args.force))
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+
+    gitignore_added = ensure_gitignore_entry(project_path, ".context-memory/")
+    store.set_feature("integration_initialized", "true")
+
+    print(f"Initialized project integration at: {project_path}")
+    print(f"Cursor MCP config: {cursor_path}")
+    print(f"Claude settings: {claude_path}")
+    if gitignore_added:
+        print("Updated .gitignore: added .context-memory/")
+    else:
+        print(".gitignore already includes .context-memory/")
+
+    executable_state, executable_detail = resolve_ctx_executable()
+    print(f"ctx executable: {executable_state} ({executable_detail})")
+    print("Next steps:")
+    print(f"1. ctx start --path {project_path}")
+    print(f"2. Open Cursor/Claude in {project_path}")
+    print(f"3. ctx status --path {project_path}")
+    return 0
+
+
 def cmd_start(args) -> int:
     ctx_home = default_ctx_home()
     registry = Registry(ctx_home)
     project_path = resolve_project_path(args, registry)
     project_path.mkdir(parents=True, exist_ok=True)
     store = ProjectStore(project_path)
-    memory_root, db_path, logs_path = project_memory_paths(project_path)
+    _memory_root, db_path, logs_path = project_memory_paths(project_path)
 
     registry.upsert_project(project_path, args.name, db_path, logs_path)
     project_row = registry.get_project(project_path)
@@ -98,7 +181,6 @@ def cmd_start(args) -> int:
             print(f"Logs: {logs_path}")
             return 0
 
-    # Repair stale recording state.
     if project_row and project_row["recording_state"] == "recording":
         stale_session = project_row["active_session_id"]
         if stale_session:
@@ -107,6 +189,7 @@ def cmd_start(args) -> int:
 
     store.set_project_metadata(args.name, "recording")
     session_id = store.create_session(args.agent)
+    _set_source_expectations(store, registry, session_id)
     pid = spawn_recorder(project_path, session_id, args.agent, ctx_home)
     registry.set_recording_state(project_path, "recording", session_id, pid)
 
@@ -150,6 +233,23 @@ def cmd_stop(args) -> int:
     return 0
 
 
+def _parse_iso_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _recent_heartbeat(ts: str | None, window_seconds: int = 600) -> bool:
+    parsed = _parse_iso_ts(ts)
+    if not parsed:
+        return False
+    age = datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)
+    return age.total_seconds() <= window_seconds
+
+
 def cmd_status(args) -> int:
     ctx_home = default_ctx_home()
     registry = Registry(ctx_home)
@@ -188,6 +288,13 @@ def cmd_status(args) -> int:
             detail = row["detail"] or ""
             print(f"- {row['source']}: {row['status']} {detail}".rstrip())
 
+        print("Integration:")
+        for row in source_rows:
+            if not str(row["source"]).startswith(("mcp:", "hook:", "fallback_logs")):
+                continue
+            heartbeat = "fresh" if _recent_heartbeat(row["updated_at"]) else "stale"
+            print(f"- {row['source']} heartbeat: {row['updated_at']} ({heartbeat})")
+
     events = snapshot["events"]
     if events:
         print("Recent events:")
@@ -210,8 +317,7 @@ def cmd_where(args) -> int:
     project_path = resolve_project_path(args, registry)
     row = registry.get_project(project_path)
     if not row:
-        # Project may not be in registry yet; derive default location.
-        _, db_path, logs_path = project_memory_paths(project_path)
+        _root, db_path, logs_path = project_memory_paths(project_path)
         print(f"DB: {db_path}")
         print(f"Logs: {logs_path}")
         return 0
@@ -296,7 +402,7 @@ def cmd_vector_enable(args) -> int:
     project_path = resolve_project_path(args, registry)
     row = registry.get_project(project_path)
     if not row:
-        store = ProjectStore(project_path)
+        _store = ProjectStore(project_path)
         _memory_root, db_path, logs_path = project_memory_paths(project_path)
         registry.upsert_project(project_path, getattr(args, "name", None), db_path, logs_path)
     registry.set_vector_enabled(project_path, True)
@@ -304,6 +410,179 @@ def cmd_vector_enable(args) -> int:
     store.set_feature("vector_enabled", "true")
     print(f"Vector search feature flag enabled for project: {project_path}")
     return 0
+
+
+def _heartbeat_from_source_rows(source_rows, source_name: str):
+    for row in source_rows:
+        if row["source"] == source_name:
+            return row
+    return None
+
+
+def _merge_config_and_heartbeat(config_status: str, config_detail: str, heartbeat_row, label: str) -> tuple[str, str]:
+    if config_status == "unavailable":
+        return ("unavailable", config_detail)
+    if config_status == "degraded":
+        return ("degraded", config_detail)
+    if heartbeat_row is None:
+        return ("degraded", f"{label} configured but no heartbeat yet")
+    hb_status = heartbeat_row["status"]
+    hb_ts = heartbeat_row["updated_at"]
+    hb_detail = heartbeat_row["detail"] or ""
+    if hb_status == "available" and _recent_heartbeat(hb_ts):
+        return ("connected", f"{hb_detail} (last={hb_ts})")
+    if hb_status == "available":
+        return ("degraded", f"stale heartbeat (last={hb_ts})")
+    if hb_status == "degraded":
+        return ("degraded", hb_detail or f"{label} degraded")
+    return ("unavailable", hb_detail or f"{label} unavailable")
+
+
+def cmd_doctor(args) -> int:
+    ctx_home = default_ctx_home()
+    registry = Registry(ctx_home)
+    project_path = resolve_project_path(args, registry)
+    store = ProjectStore(project_path)
+
+    cursor_cfg_status, cursor_cfg_detail = inspect_cursor_mcp_config(project_path)
+    claude_mcp_cfg_status, claude_mcp_cfg_detail, claude_hooks_cfg = inspect_claude_settings(project_path)
+    claude_hooks_cfg_status, claude_hooks_cfg_detail = claude_hooks_cfg
+    exe_status, exe_detail = resolve_ctx_executable()
+
+    snapshot = store.status_snapshot(recent_limit=1)
+    source_rows = snapshot.get("source_status", [])
+    cursor_hb = _heartbeat_from_source_rows(source_rows, "mcp:cursor")
+    claude_hb = _heartbeat_from_source_rows(source_rows, "mcp:claude")
+    hook_hb = _heartbeat_from_source_rows(source_rows, "hook:claude")
+
+    cursor_state, cursor_detail = _merge_config_and_heartbeat(
+        cursor_cfg_status, cursor_cfg_detail, cursor_hb, "cursor MCP"
+    )
+    claude_state, claude_detail = _merge_config_and_heartbeat(
+        claude_mcp_cfg_status, claude_mcp_cfg_detail, claude_hb, "claude MCP"
+    )
+    hook_state, hook_detail = _merge_config_and_heartbeat(
+        claude_hooks_cfg_status, claude_hooks_cfg_detail, hook_hb, "claude hooks"
+    )
+
+    adapters = registry.get_adapter_configs()
+    if not adapters:
+        fallback_state = "unavailable"
+        fallback_detail = "no fallback adapter logs configured"
+    else:
+        existing = []
+        missing = []
+        for adapter in ("cursor", "claude"):
+            path = adapters.get(adapter)
+            if not path:
+                continue
+            p = normalize_path(path)
+            if p.exists():
+                existing.append(f"{adapter}:{p}")
+            else:
+                missing.append(f"{adapter}:{p}")
+        if existing:
+            fallback_state = "connected"
+            fallback_detail = f"configured logs: {'; '.join(existing)}"
+            if missing:
+                fallback_detail += f"; missing: {'; '.join(missing)}"
+        else:
+            fallback_state = "degraded"
+            fallback_detail = f"configured logs missing: {'; '.join(missing)}"
+
+    payload = {
+        "project": str(project_path),
+        "checks": {
+            "cursor_mcp": {"status": cursor_state, "detail": cursor_detail},
+            "claude_mcp": {"status": claude_state, "detail": claude_detail},
+            "claude_hooks": {"status": hook_state, "detail": hook_detail},
+            "fallback_logs": {"status": fallback_state, "detail": fallback_detail},
+            "ctx_executable": {"status": exe_status, "detail": exe_detail},
+        },
+    }
+
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=True))
+    else:
+        print(f"Project: {payload['project']}")
+        for key in ("cursor_mcp", "claude_mcp", "claude_hooks", "fallback_logs", "ctx_executable"):
+            row = payload["checks"][key]
+            print(f"- {key}: {row['status']} - {row['detail']}")
+    return 0
+
+
+def _extract_hook_summary(payload: dict, event_name: str) -> tuple[str, list[str], str]:
+    mapping = {
+        "UserPromptSubmit": "user_intent",
+        "PreToolUse": "tool_use",
+        "PostToolUse": "tool_use",
+        "Stop": "handoff",
+    }
+    event_type = mapping.get(event_name, "task_status")
+
+    summary = None
+    for key in ("summary", "message", "text", "prompt", "input", "content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            summary = value.strip()
+            break
+    if not summary:
+        summary = f"Claude hook event received: {event_name}."
+
+    files = payload.get("files_touched") or payload.get("files") or payload.get("changed_files") or []
+    if not isinstance(files, list):
+        files = []
+    clean_files = [str(item) for item in files if isinstance(item, str)]
+    return event_type, clean_files, summary
+
+
+def cmd_hook_ingest(args) -> int:
+    ctx_home = default_ctx_home()
+    _registry = Registry(ctx_home)
+    project_path = normalize_path(args.project_path)
+    store = ProjectStore(project_path)
+
+    session_id = _resolve_runtime_session_id(store)
+    if session_id is None:
+        print("No active ctx session; hook event ignored.")
+        return 0
+
+    raw = sys.stdin.read()
+    payload: dict = {}
+    if raw.strip():
+        try:
+            loaded = json.loads(raw)
+            if isinstance(loaded, dict):
+                payload = loaded
+        except json.JSONDecodeError:
+            payload = {"text": raw.strip()}
+
+    event_type, files_touched, summary = _extract_hook_summary(payload, args.event)
+    tool_name = None
+    tool_result = None
+    if args.event in {"PreToolUse", "PostToolUse"}:
+        if isinstance(payload.get("tool_name"), str):
+            tool_name = payload["tool_name"]
+        if isinstance(payload.get("result"), str):
+            tool_result = payload["result"]
+
+    store.insert_event(
+        session_id=session_id,
+        event_type=event_type,
+        summary=summary,
+        files_touched=files_touched,
+        source="hook:claude",
+        tool_name=tool_name,
+        tool_result=tool_result,
+    )
+    store.update_source_status(session_id, "hook:claude", "available", f"{args.event} heartbeat {utc_now()}")
+    print(f"Hook event ingested: {args.event}")
+    return 0
+
+
+def cmd_mcp_serve(args) -> int:
+    server = MCPServer(normalize_path(args.project_path))
+    return server.serve()
 
 
 def cmd_recorder_run(args) -> int:
@@ -322,6 +601,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ctx", description="Local project context memory CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    p_init = subparsers.add_parser("init", help="Initialize project-local MCP + hook configuration")
+    p_init.add_argument("--path", default=None)
+    p_init.add_argument("--name", default=None)
+    p_init.add_argument("--force", action="store_true")
+    p_init.set_defaults(func=cmd_init)
+
     p_start = subparsers.add_parser("start", help="Start recording context for a project")
     p_start.add_argument("--name", default=None)
     p_start.add_argument("--path", default=None)
@@ -337,6 +622,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_status.add_argument("--path", default=None)
     p_status.add_argument("--name", default=None)
     p_status.set_defaults(func=cmd_status)
+
+    p_doctor = subparsers.add_parser("doctor", help="Check MCP/hook integration health")
+    p_doctor.add_argument("--path", default=None)
+    p_doctor.add_argument("--name", default=None)
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.set_defaults(func=cmd_doctor)
 
     p_where = subparsers.add_parser("where", help="Print local memory storage paths")
     p_where.add_argument("--path", default=None)
@@ -371,6 +662,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_vector_enable.add_argument("--name", default=None)
     p_vector_enable.set_defaults(func=cmd_vector_enable)
 
+    p_mcp = subparsers.add_parser("mcp", help="MCP server operations")
+    mcp_sub = p_mcp.add_subparsers(dest="mcp_command", required=True)
+    p_mcp_serve = mcp_sub.add_parser("serve", help="Run stdio MCP server")
+    p_mcp_serve.add_argument("--project-path", required=True)
+    p_mcp_serve.set_defaults(func=cmd_mcp_serve)
+
+    p_hook = subparsers.add_parser("hook", help="Hook ingestion operations")
+    hook_sub = p_hook.add_subparsers(dest="hook_command", required=True)
+    p_hook_ingest = hook_sub.add_parser("ingest", help="Ingest Claude hook payload from stdin")
+    p_hook_ingest.add_argument("--project-path", required=True)
+    p_hook_ingest.add_argument("--event", required=True)
+    p_hook_ingest.set_defaults(func=cmd_hook_ingest)
+
     p_recorder = subparsers.add_parser("_recorder_run")
     p_recorder.add_argument("--path", required=True)
     p_recorder.add_argument("--session-id", required=True)
@@ -389,3 +693,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
