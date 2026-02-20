@@ -233,6 +233,76 @@ def cmd_stop(args) -> int:
     return 0
 
 
+def cmd_sessions(args) -> int:
+    ctx_home = default_ctx_home()
+    registry = Registry(ctx_home)
+    project_path = resolve_project_path(args, registry)
+    project_row = registry.get_project(project_path)
+    if not project_row:
+        print(f"Project not found: {project_path}")
+        return 1
+
+    store = ProjectStore(project_path)
+    rows = store.list_sessions(limit=args.limit)
+    if not rows:
+        print("No sessions found.")
+        return 0
+
+    print(f"Project: {project_path}")
+    for row in rows:
+        stop = row["stopped_at"] or "-"
+        ext = row["external_session_ref"] or "-"
+        print(
+            f"- id={row['id']} state={row['state']} agent={row['agent']} "
+            f"started={row['started_at']} stopped={stop} external_ref={ext}"
+        )
+    return 0
+
+
+def cmd_resume(args) -> int:
+    ctx_home = default_ctx_home()
+    registry = Registry(ctx_home)
+    project_path = resolve_project_path(args, registry)
+    project_row = registry.get_project(project_path)
+    if not project_row:
+        print(f"Project not found: {project_path}")
+        return 1
+    if project_row["deleted_at"]:
+        print(f"Project '{project_path}' is soft-deleted. Purge or restore before resume.")
+        return 1
+
+    store = ProjectStore(project_path)
+    target = store.get_session(int(args.session_id))
+    if not target:
+        print(f"Session not found: {args.session_id}")
+        return 1
+
+    if project_row["recording_state"] == "recording":
+        active_pid = project_row["recorder_pid"]
+        active_session_id = project_row["active_session_id"]
+        if active_pid and is_pid_alive(int(active_pid)):
+            if int(active_session_id or 0) == int(args.session_id):
+                print(f"Already recording session {args.session_id}.")
+                return 0
+            print(
+                f"Another session is currently recording (session={active_session_id}). "
+                f"Run `ctx stop --path {project_path}` first."
+            )
+            return 1
+        # stale state recovery
+        if active_session_id:
+            store.set_session_state(int(active_session_id), "stopped")
+        registry.set_recording_state(project_path, "stopped", None, None)
+
+    store.resume_session(int(args.session_id))
+    _set_source_expectations(store, registry, int(args.session_id))
+    session_agent = target["agent"] or "auto"
+    pid = spawn_recorder(project_path, int(args.session_id), session_agent, ctx_home)
+    registry.set_recording_state(project_path, "recording", int(args.session_id), pid)
+    print(f"Resumed session {args.session_id}. PID: {pid}")
+    return 0
+
+
 def _parse_iso_ts(ts: str | None) -> datetime | None:
     if not ts:
         return None
@@ -615,6 +685,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_start.add_argument("--agent", default="auto", choices=["cursor", "claude", "auto"])
     p_start.set_defaults(func=cmd_start)
 
+    p_resume = subparsers.add_parser("resume", help="Resume recording on an existing session id")
+    p_resume.add_argument("--session-id", required=True, type=int)
+    p_resume.add_argument("--path", default=None)
+    p_resume.add_argument("--name", default=None)
+    p_resume.set_defaults(func=cmd_resume)
+
     p_stop = subparsers.add_parser("stop", help="Stop active recording for a project")
     p_stop.add_argument("--path", default=None)
     p_stop.add_argument("--name", default=None)
@@ -649,6 +725,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_list = subparsers.add_parser("list", help="List active projects")
     p_list.set_defaults(func=cmd_list)
+
+    p_sessions = subparsers.add_parser("sessions", help="List sessions for a project")
+    p_sessions.add_argument("--path", default=None)
+    p_sessions.add_argument("--name", default=None)
+    p_sessions.add_argument("--limit", default=20, type=int)
+    p_sessions.set_defaults(func=cmd_sessions)
 
     p_adapter = subparsers.add_parser("adapter", help="Adapter management")
     adapter_sub = p_adapter.add_subparsers(dest="adapter_command", required=True)
