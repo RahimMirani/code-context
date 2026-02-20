@@ -188,7 +188,20 @@ class CtxIntegrationTests(unittest.TestCase):
         claude_dir = self.project / ".claude"
         claude_dir.mkdir(parents=True, exist_ok=True)
         (claude_dir / "settings.local.json").write_text(
-            json.dumps({"mcpServers": {"other": {"command": "other"}}, "hooks": {"Foo": []}, "custom": 1}),
+            json.dumps(
+                {
+                    "mcpServers": {"other": {"command": "other"}},
+                    "hooks": {
+                        "Foo": [],
+                        "UserPromptSubmit": [{"type": "command", "command": "ctx hook ingest --project-path /tmp/x --event UserPromptSubmit"}],
+                        "PreToolUse": [
+                            {"type": "command", "command": "ctx hook ingest --project-path /tmp/x --event PreToolUse"},
+                            {"matcher": {"tools": ["BashTool"]}, "hooks": [{"type": "command", "command": "echo old"}]},
+                        ],
+                    },
+                    "custom": 1,
+                }
+            ),
             encoding="utf-8",
         )
 
@@ -208,6 +221,40 @@ class CtxIntegrationTests(unittest.TestCase):
         self.assertIn("PreToolUse", claude_cfg["hooks"])
         self.assertIn("PostToolUse", claude_cfg["hooks"])
         self.assertIn("Stop", claude_cfg["hooks"])
+        for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
+            entries = claude_cfg["hooks"][event]
+            self.assertTrue(isinstance(entries, list) and len(entries) >= 1)
+            first = entries[0]
+            self.assertIsInstance(first, dict)
+            self.assertIn("hooks", first)
+            self.assertTrue(isinstance(first["hooks"], list) and len(first["hooks"]) >= 1)
+        # Tool hooks should include a ctx entry with string matcher format expected by Claude.
+        def _has_ctx_tool_entry(entries, event_name: str) -> bool:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("matcher") != "*":
+                    continue
+                hooks = entry.get("hooks")
+                if not isinstance(hooks, list):
+                    continue
+                for hook in hooks:
+                    if (
+                        isinstance(hook, dict)
+                        and hook.get("type") == "command"
+                        and isinstance(hook.get("command"), str)
+                        and f"--event {event_name}" in hook.get("command")
+                        and "ctx hook ingest --project-path" in hook.get("command")
+                    ):
+                        return True
+            return False
+
+        self.assertTrue(_has_ctx_tool_entry(claude_cfg["hooks"]["PreToolUse"], "PreToolUse"))
+        self.assertTrue(_has_ctx_tool_entry(claude_cfg["hooks"]["PostToolUse"], "PostToolUse"))
+        # Legacy direct command entries should be removed.
+        for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
+            for entry in claude_cfg["hooks"][event]:
+                self.assertNotEqual(entry.get("type"), "command")
         self.assertIn(".context-memory/", (self.project / ".gitignore").read_text(encoding="utf-8"))
 
     def test_mcp_server_append_event_and_doctor(self):
