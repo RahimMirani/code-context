@@ -114,6 +114,49 @@ class CtxIntegrationTests(unittest.TestCase):
         result = self.run_ctx(["where", "--name", "same"], expected=2)
         self.assertIn("ambiguous", result.stdout.lower())
 
+    def test_sessions_list_and_resume(self):
+        self.run_ctx(["start", "--path", str(self.project), "--name", "resume-demo", "--agent", "auto"])
+        time.sleep(0.8)
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+        self.run_ctx(["start", "--path", str(self.project), "--name", "resume-demo", "--agent", "auto"])
+        time.sleep(0.8)
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+        sessions_out = self.run_ctx(["sessions", "--path", str(self.project)])
+        self.assertIn("id=", sessions_out.stdout)
+        lines = [line for line in sessions_out.stdout.splitlines() if line.strip().startswith("- id=")]
+        self.assertGreaterEqual(len(lines), 2)
+        first_session_id = int(lines[-1].split("id=")[1].split(" ", 1)[0])
+
+        resume_out = self.run_ctx(["resume", "--path", str(self.project), "--session-id", str(first_session_id)])
+        self.assertIn("Resumed session", resume_out.stdout)
+
+        status = self.run_ctx(["status", "--path", str(self.project)])
+        self.assertIn(f"Active session: {first_session_id}", status.stdout)
+
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+    def test_delete_single_session(self):
+        self.run_ctx(["start", "--path", str(self.project), "--name", "delete-session", "--agent", "auto"])
+        time.sleep(0.8)
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+        self.run_ctx(["start", "--path", str(self.project), "--name", "delete-session", "--agent", "auto"])
+        time.sleep(0.8)
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+        sessions_out = self.run_ctx(["sessions", "--path", str(self.project)])
+        lines = [line for line in sessions_out.stdout.splitlines() if line.strip().startswith("- id=")]
+        self.assertGreaterEqual(len(lines), 2)
+        newest_id = int(lines[0].split("id=")[1].split(" ", 1)[0])
+
+        delete_out = self.run_ctx(["delete", "--path", str(self.project), "--session-id", str(newest_id)])
+        self.assertIn(f"Deleted session {newest_id}", delete_out.stdout)
+
+        sessions_after = self.run_ctx(["sessions", "--path", str(self.project)])
+        self.assertNotIn(f"id={newest_id} ", sessions_after.stdout)
+
     def test_adapter_summary_ingest_no_raw_storage(self):
         log_path = self.base / "cursor.log"
         log_path.write_text("", encoding="utf-8")
