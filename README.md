@@ -6,58 +6,143 @@ Tech stack:
 - Global registry in `~/.context-agent/registry.db` (override with `CTX_HOME`)
 - MCP stdio server for Cursor/Claude integration
 
-## Install
+## Install (global command `ctx`)
 
 One-command installer:
 - `bash /absolute/path/to/context_store/install.sh`
 
-Recommended global install:
+Recommended:
 - `python3 -m pip install --user pipx`
 - `python3 -m pipx ensurepath`
 - `pipx install /absolute/path/to/context_store`
 
-Alternative:
-- `python3 -m pip install --user /absolute/path/to/context_store`
+Upgrade:
+- `python3 -m pipx install --force /absolute/path/to/context_store`
 
-## First-time repo setup
+Check install:
+- `which ctx`
+- `ctx --help`
 
-Inside the repo you want to track:
+## First-time setup in any repo
+
+From the repo root you want to track:
 - `ctx init`
 - `ctx start`
 
-If you upgraded from an older version that wrote legacy Claude hook format, run:
+If upgrading from older hook format:
 - `ctx init --force`
 
 `ctx init` does:
-- writes `.cursor/mcp.json` with `ctx-memory` MCP server
-- writes `.claude/settings.local.json` with `ctx-memory` MCP + Claude hook commands
-- ensures `.context-memory/` is in `.gitignore`
+- writes `.cursor/mcp.json` with `ctx-memory` server
+- writes `.claude/settings.local.json` with `ctx-memory` + Claude hooks
+- ensures `.context-memory/` exists in `.gitignore`
 
-## Daily usage
+## Command reference
 
-- `ctx status`
-- `ctx where`
-- `ctx doctor`
-- `ctx sessions`
-- `ctx resume --session-id <id>`
-- `ctx delete --session-id <id>`
-- `ctx stop`
+Core:
+- `ctx start [--name <display_name>] [--path <project_path>] [--agent cursor|claude|auto]`
+- `ctx stop [--path <project_path>]`
+- `ctx status [--path <project_path>]`
+- `ctx where [--path <project_path>]`
+- `ctx sessions [--path <project_path>]`
+- `ctx resume --session-id <id> [--path <project_path>]`
+- `ctx delete --session-id <id> [--path <project_path>]`
+- `ctx delete [--path <project_path>]` (soft-delete project memory)
+- `ctx purge [--path <project_path>] --force` (hard delete)
+- `ctx list`
+- `ctx doctor [--path <project_path>] [--json]`
 
-You can still use explicit path mode:
-- `ctx start --path /abs/project --name my-project --agent auto`
+Adapters (fallback mode):
+- `ctx adapter configure cursor --log-path <path>`
+- `ctx adapter configure claude --log-path <path>`
 
-## MCP + Hook commands
+MCP/hook runtime:
+- `ctx mcp serve --project-path <project_path>`
+- `ctx hook ingest --project-path <project_path> --event <event_name>`
 
-- `ctx mcp serve --project-path /abs/project`
-- `ctx hook ingest --project-path /abs/project --event UserPromptSubmit`
+Feature flag:
+- `ctx vector enable [--path <project_path>]`
 
-These are usually launched by Cursor/Claude, not manually.
+## Inspect context DB
 
-## Fallback adapter mode (optional)
+From repo root:
+- `sqlite3 .context-memory/context.db`
 
-If you want file-based ingestion fallback:
-- `ctx adapter configure cursor --log-path /path/to/cursor.log`
-- `ctx adapter configure claude --log-path /path/to/claude.log`
+Useful queries:
+```sql
+.tables
+.schema events
+SELECT id,created_at,event_type,source,summary FROM events ORDER BY id DESC LIMIT 30;
+SELECT id,created_at,tool_name,purpose,result FROM tool_usage ORDER BY id DESC LIMIT 20;
+SELECT id,created_at,summary FROM decisions ORDER BY id DESC LIMIT 20;
+```
+
+## Cursor policy file
+
+Path:
+- `.cursor/rules/overall.md`
+
+Suggested content:
+
+```md
+# Context memory policy (ctx-memory)
+
+For this repository, always use MCP server `ctx-memory` so context is shared across chats/sessions.
+
+## Session start (required)
+1. Call `ping` with `{"client":"cursor"}`.
+2. Call `get_context` with `{"max_events":20,"include_effective_state":true}`.
+3. If no active chat session is known, call `start_chat_session` with `{"client":"cursor"}`.
+
+## Per-turn logging (strictly required). It should be used every prompt.
+1. After each user message, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "user_intent"`
+   - concise summary of user ask
+   - `files_touched`: `[]` unless user directly references files
+2. After each assistant response, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "task_status"`
+   - concise summary of what answer was given, what action was taken, and next step
+   - `files_touched`: repo-relative paths changed in this turn, or `[]`
+3. Do not skip post-response logging, even for short replies.
+
+## Action logging (required)
+1. When using tools, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "tool_use"`
+   - `tool_name` and short `tool_result`
+2. When a key choice is made, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "decision_made"`
+   - summary of decision and why
+3. When tests run or errors happen, log `test_result` / `error_seen`.
+
+## Handoff/end (required)
+1. Call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "handoff"`
+   - short summary of completed + pending work
+2. If session id is available, call `stop_chat_session`.
+
+## Constraints
+1. Never store raw prompt text or full assistant responses.
+2. Store only short factual summaries.
+3. Always include `client: "cursor"` in every `append_event` call (never `mcp:unknown`).
+4. Prefer multiple small events over one long event.
+5. If an MCP call fails, retry once and continue; do not silently skip logging.
+```
+
+## Claude policy file
+
+Path:
+- `.claude/Claude.md`
+
+Suggested content:
+
+```md
+After every assistant response, write a concise answer summary via `ctx hook ingest` with a top-level JSON field `summary` (no raw transcript).
+```
 
 ## Features
 
