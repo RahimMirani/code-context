@@ -38,6 +38,8 @@ If you upgraded from an older version that wrote legacy Claude hook format, run:
 - `ctx status`
 - `ctx where`
 - `ctx doctor`
+- `ctx sessions`
+- `ctx resume --session-id <id>`
 - `ctx stop`
 
 You can still use explicit path mode:
