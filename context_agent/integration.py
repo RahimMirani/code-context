@@ -18,6 +18,53 @@ def _hook_command(project: Path, event: str) -> str:
     return f'ctx hook ingest --project-path "{path}" --event {event}'
 
 
+def _legacy_hook_command(project: Path, event: str) -> str:
+    return f"ctx hook ingest --project-path {project} --event {event}"
+
+
+def _is_ctx_hook_command(value: str, project: Path, event: str) -> bool:
+    if value in {_hook_command(project, event), _legacy_hook_command(project, event)}:
+        return True
+    return "ctx hook ingest --project-path" in value and f"--event {event}" in value
+
+
+def _ctx_hook_entry(project: Path, event: str) -> dict:
+    command = _hook_command(project, event)
+    if event in {"PreToolUse", "PostToolUse"}:
+        return {
+            "matcher": "*",
+            "hooks": [{"type": "command", "command": command}],
+        }
+    return {
+        "hooks": [{"type": "command", "command": command}],
+    }
+
+
+def _entry_contains_ctx_hook(entry: object, project: Path, event: str) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    # Legacy invalid format:
+    # {"type":"command","command":"ctx hook ingest ..."}
+    if (
+        entry.get("type") == "command"
+        and isinstance(entry.get("command"), str)
+        and _is_ctx_hook_command(entry.get("command"), project, event)
+    ):
+        return True
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return False
+    for hook in hooks:
+        if (
+            isinstance(hook, dict)
+            and hook.get("type") == "command"
+            and isinstance(hook.get("command"), str)
+            and _is_ctx_hook_command(hook.get("command"), project, event)
+        ):
+            return True
+    return False
+
+
 def _atomic_write_json(path: Path, payload: dict) -> None:
     ensure_dir(path.parent)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -98,18 +145,12 @@ def update_claude_settings(project_path: Path, force: bool = False) -> Path:
         existing = hooks.get(event)
         if not isinstance(existing, list):
             existing = []
-        command = _hook_command(project, event)
         filtered = [
             item
             for item in existing
-            if not (
-                isinstance(item, dict)
-                and item.get("type") == "command"
-                and isinstance(item.get("command"), str)
-                and "ctx hook ingest --project-path" in item["command"]
-            )
+            if not _entry_contains_ctx_hook(item, project, event)
         ]
-        filtered.append({"type": "command", "command": command})
+        filtered.append(_ctx_hook_entry(project, event))
         hooks[event] = filtered
 
     _atomic_write_json(settings_path, payload)
@@ -183,15 +224,7 @@ def inspect_claude_settings(project_path: Path) -> tuple[str, str, tuple[str, st
             ok = False
             if isinstance(entries, list):
                 for item in entries:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("type") == "command"
-                        and isinstance(item.get("command"), str)
-                        and (
-                            item.get("command") == _hook_command(project, event)
-                            or item.get("command") == f"ctx hook ingest --project-path {project} --event {event}"
-                        )
-                    ):
+                    if _entry_contains_ctx_hook(item, project, event):
                         ok = True
                         break
             if not ok:
