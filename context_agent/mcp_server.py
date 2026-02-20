@@ -23,6 +23,10 @@ class MCPServer:
     def __init__(self, project_path: Path):
         self.project_path = normalize_path(project_path)
         self.store = ProjectStore(self.project_path)
+        # Transport is auto-detected from client input:
+        # - "lsp": Content-Length framed JSON-RPC
+        # - "jsonl": one JSON object per line
+        self._transport_mode = "auto"
 
     def _read_message(self) -> dict[str, Any] | None:
         first_line = sys.stdin.buffer.readline()
@@ -31,6 +35,8 @@ class MCPServer:
 
         line = first_line.strip()
         if line.startswith(b"Content-Length:"):
+            if self._transport_mode == "auto":
+                self._transport_mode = "lsp"
             try:
                 length = int(line.split(b":", 1)[1].strip().decode("ascii"))
             except Exception as exc:  # noqa: BLE001
@@ -49,6 +55,8 @@ class MCPServer:
             except json.JSONDecodeError as exc:
                 raise MCPError(-32700, f"invalid JSON payload: {exc}") from exc
 
+        if self._transport_mode == "auto":
+            self._transport_mode = "jsonl"
         try:
             return json.loads(line.decode("utf-8"))
         except json.JSONDecodeError as exc:
@@ -56,6 +64,10 @@ class MCPServer:
 
     def _write_message(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        if self._transport_mode == "jsonl":
+            sys.stdout.buffer.write(encoded + b"\n")
+            sys.stdout.buffer.flush()
+            return
         header = f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii")
         sys.stdout.buffer.write(header + encoded)
         sys.stdout.buffer.flush()
@@ -304,4 +316,3 @@ class MCPServer:
             except Exception as exc:  # noqa: BLE001
                 self._write_message(self._jsonrpc_error(None, -32603, f"Internal error: {exc}"))
                 return 1
-
