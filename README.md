@@ -101,6 +101,9 @@ SELECT id,created_at,summary FROM decisions ORDER BY id DESC LIMIT 20;
 Path:
 - `.cursor/rules/overall.md`
 
+Important:
+- Tell Cursor to follow these rules on every message in the chat.
+
 Suggested content:
 
 ```md
@@ -156,6 +159,9 @@ For this repository, always use MCP server `ctx-memory` so context is shared acr
 
 Path:
 - `.claude/Claude.md`
+
+Important:
+- Tell Claude to follow these rules on every message in the chat.
 
 Suggested content:
 
