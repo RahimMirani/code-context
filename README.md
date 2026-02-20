@@ -36,6 +36,14 @@ If you see `ctx: command not found`:
   - `export PATH="$HOME/.local/bin:$HOME/Library/Python/3.9/bin:$PATH"`
   - `exec zsh -l`
 
+Claude MCP add command pitfall:
+- If you use multiline `claude mcp add ...` commands, a missing trailing `\` can break argument parsing.
+- Symptom: `--project-path` gets no value and the path is executed as a command (`permission denied`).
+- Safe fix:
+  - Remove broken entry: `claude mcp remove ctx-memory`
+  - Re-add in one line (recommended):
+    - `claude mcp add ctx-memory /Users/aliuraishmirani/.local/pipx/venvs/context-agent-local/bin/ctx -- mcp serve --project-path /Users/aliuraishmirani/agentbay-dashboard/AgentBay-Dashboard-V2`
+
 ## Configure in a project (minimal workflow)
 
 In the project you want to record:
@@ -166,7 +174,12 @@ Important:
 Suggested content:
 
 ```md
-After every assistant response, write a concise answer summary via `ctx hook ingest` with a top-level JSON field `summary` (no raw transcript).
+Use ctx-memory MCP only to read context:
+- At chat start, call `get_context` once.
+- Do not use MCP for logging events.
+
+For logging, use hooks only:
+- After each assistant response, write a concise summary via `ctx hook ingest` with top-level JSON field `summary` (no raw transcript).
 ```
 
 ## Features
