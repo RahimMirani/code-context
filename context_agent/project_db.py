@@ -367,6 +367,35 @@ class ProjectStore:
 
         return self._execute_retry(_read)
 
+    def get_latest_session(self):
+        def _read():
+            with self._connect() as conn:
+                return conn.execute(
+                    """
+                    SELECT * FROM sessions
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+
+        return self._execute_retry(_read)
+
+    def set_session_external_ref(self, session_id: int, external_session_ref: str) -> None:
+        now = utc_now()
+
+        def _write():
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE sessions
+                    SET external_session_ref = ?, last_updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (external_session_ref, now, session_id),
+                )
+
+        self._execute_retry(_write)
+
     def set_session_state(self, session_id: int, state: str) -> None:
         now = utc_now()
         stop_at = now if state == "stopped" else None
