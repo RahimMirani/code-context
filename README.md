@@ -20,6 +20,22 @@ Check install:
 - `which ctx`
 - `ctx --help`
 
+Where to run these:
+- Run install commands in any terminal directory (not tied to a specific repo).
+- Run project commands (`ctx init`, `ctx start`, `ctx stop`, etc.) inside the target project root.
+
+If you see `ctx: command not found`:
+- Why: `ctx` was installed, but your shell `PATH` was not reloaded yet.
+- Fix:
+  - `exec zsh -l`
+  - `which ctx`
+  - `ctx --help`
+- If still not found, run directly once:
+  - `~/.local/bin/ctx --help`
+- If needed, add this to `~/.zshrc`, then reload:
+  - `export PATH="$HOME/.local/bin:$HOME/Library/Python/3.9/bin:$PATH"`
+  - `exec zsh -l`
+
 ## Configure in a project (minimal workflow)
 
 In the project you want to record:
