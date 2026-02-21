@@ -5,7 +5,7 @@ Tech stack:
 - Project-local SQLite memory in `.context-memory/`
 - Global registry in `~/.context-agent/registry.db` (override with `CTX_HOME`)
 - MCP stdio server for Cursor/Claude integration
- 
+
 ## Install globally (from GitHub)
 
 Install `ctx` globally so it works in any repo:
