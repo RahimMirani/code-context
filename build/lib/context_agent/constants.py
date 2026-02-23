@@ -6,6 +6,8 @@ DEDUPE_WINDOW_SECONDS = 30
 SUMMARY_MAX_CHARS = 500
 RECENT_EVENTS_DEFAULT = 5
 RECORDING_STATES = {"recording", "stopped", "stopping"}
+SUPPORTED_MCP_CLIENTS = ("cursor", "claude", "codex")
+SUPPORTED_ADAPTERS = ("cursor", "claude", "codex")
 EVENT_TYPES = {
     "user_intent",
     "agent_plan",
