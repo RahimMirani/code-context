@@ -19,6 +19,7 @@ from .constants import (
 )
 from .integration import (
     ensure_gitignore_entry,
+    ensure_tool_rules,
     inspect_claude_settings,
     inspect_codex_config,
     inspect_cursor_mcp_config,
@@ -229,6 +230,10 @@ def cmd_init(args) -> int:
         cursor_path = update_cursor_mcp_config(project_path, force=bool(args.force))
         claude_path = update_claude_settings(project_path, force=bool(args.force))
         codex_path = update_codex_config(project_path, force=bool(args.force))
+        rules_result = {
+            tool: ensure_tool_rules(project_path, tool)
+            for tool in SUPPORTED_MCP_CLIENTS
+        }
     except ValueError as exc:
         print(str(exc))
         return 1
@@ -240,6 +245,10 @@ def cmd_init(args) -> int:
     print(f"Cursor MCP config: {cursor_path}")
     print(f"Claude settings: {claude_path}")
     print(f"Codex config: {codex_path}")
+    for tool in SUPPORTED_MCP_CLIENTS:
+        rules_path, changed = rules_result[tool]
+        status = "updated" if changed else "already present"
+        print(f"{tool.capitalize()} rules: {rules_path} ({status})")
     if gitignore_added:
         print("Updated .gitignore: added .context-memory/")
     else:
@@ -597,6 +606,21 @@ def cmd_vector_enable(args) -> int:
     return 0
 
 
+def cmd_rules(args) -> int:
+    ctx_home = default_ctx_home()
+    registry = Registry(ctx_home)
+    project_path = resolve_project_path(args, registry)
+    project_path.mkdir(parents=True, exist_ok=True)
+    try:
+        path, changed = ensure_tool_rules(project_path, args.tool)
+    except ValueError as exc:
+        print(str(exc))
+        return 1
+    status = "updated" if changed else "already present"
+    print(f"{args.tool.capitalize()} rules: {path} ({status})")
+    return 0
+
+
 def _heartbeat_from_source_rows(source_rows, source_name: str):
     for row in source_rows:
         if row["source"] == source_name:
@@ -867,6 +891,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_vector_enable.add_argument("--path", default=None)
     p_vector_enable.add_argument("--name", default=None)
     p_vector_enable.set_defaults(func=cmd_vector_enable)
+
+    p_rules = subparsers.add_parser("rules", help="Ensure context-memory policy rules for one tool")
+    p_rules.add_argument("tool", choices=list(SUPPORTED_MCP_CLIENTS))
+    p_rules.add_argument("--path", default=None)
+    p_rules.add_argument("--name", default=None)
+    p_rules.set_defaults(func=cmd_rules)
 
     p_mcp = subparsers.add_parser("mcp", help="MCP server operations")
     mcp_sub = p_mcp.add_subparsers(dest="mcp_command", required=True)
