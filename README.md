@@ -233,25 +233,53 @@ Recommended:
 Suggested content:
 
 ```md
-Use ctx-memory MCP for this repo.
+For this repository, always use MCP server `ctx-memory` so context is shared across chats/sessions.
+Do not search for memory.md or context files.
+Use ctx-memory MCP only for context.
+First action every chat: ping + get_context (+ start_chat_session if needed).”
 
-At chat start:
+## Session start (required)
 1. Call `ping` with `{"client":"codex"}`.
 2. Call `get_context` with `{"max_events":20,"include_effective_state":true}`.
-3. If no active session is known, call `start_chat_session` with `{"client":"codex"}`.
+3. If no active chat session is known, call `start_chat_session` with `{"client":"codex"}`.
 
-Per turn:
-1. After user message, call `append_event` with:
+## Per-turn logging (strictly required). It should be used every prompt.
+1. After each user message, call `append_event` with:
    - `client: "codex"`
    - `event_type: "user_intent"`
-   - concise summary
-2. After assistant message, call `append_event` with:
+   - concise summary of user ask
+   - `files_touched`: `[]` unless user directly references files
+2. After each assistant response, call `append_event` with:
    - `client: "codex"`
    - `event_type: "task_status"`
-   - concise summary
+   - concise summary of what answer was given, what action was taken, and next step
+   - `files_touched`: repo-relative paths changed in this turn, or `[]`
+3. Do not skip post-response logging, even for short replies.
 
-Use `tool_use`, `decision_made`, `test_result`, `error_seen` when relevant.
-At handoff, append `handoff` and stop session if session id is available.
+## Action logging (required)
+1. When using tools, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "tool_use"`
+   - `tool_name` and short `tool_result`
+2. When a key choice is made, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "decision_made"`
+   - summary of decision and why
+3. When tests run or errors happen, log `test_result` / `error_seen`.
+
+## Handoff/end (required)
+1. Call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "handoff"`
+   - short summary of completed + pending work
+2. If session id is available, call `stop_chat_session`.
+
+## Constraints
+1. Never store raw prompt text or full assistant responses.
+2. Store only short factual summaries.
+3. Always include `client: "codex"` in every `append_event` call (never `mcp:unknown`).
+4. Prefer multiple small events over one long event.
+5. If an MCP call fails, retry once and continue; do not silently skip logging.
 ```
 
 ## Features
