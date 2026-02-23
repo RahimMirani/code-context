@@ -11,13 +11,20 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .constants import DEFAULT_CAP_BYTES, RECENT_EVENTS_DEFAULT
+from .constants import (
+    DEFAULT_CAP_BYTES,
+    RECENT_EVENTS_DEFAULT,
+    SUPPORTED_ADAPTERS,
+    SUPPORTED_MCP_CLIENTS,
+)
 from .integration import (
     ensure_gitignore_entry,
     inspect_claude_settings,
+    inspect_codex_config,
     inspect_cursor_mcp_config,
     resolve_ctx_executable,
     update_claude_settings,
+    update_codex_config,
     update_cursor_mcp_config,
 )
 from .mcp_server import MCPServer
@@ -25,6 +32,30 @@ from .project_db import ProjectStore, project_memory_paths
 from .recorder import Recorder
 from .registry import Registry
 from .utils import human_bytes, is_pid_alive, normalize_path, terminate_pid, utc_now, wait_for_process_exit
+
+REPO_SNAPSHOT_EXCLUDED_DIRS = {
+    ".git",
+    ".context-memory",
+    ".venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".idea",
+    ".vscode",
+}
+REPO_SNAPSHOT_KEY_FILES = (
+    "README.md",
+    "README.rst",
+    "README.txt",
+    "pyproject.toml",
+    "setup.py",
+    "package.json",
+    "requirements.txt",
+    "Makefile",
+    "Dockerfile",
+    "AGENTS.md",
+)
 
 
 def default_ctx_home() -> Path:
@@ -87,8 +118,8 @@ def spawn_recorder(project_path: Path, session_id: int, agent: str, ctx_home: Pa
 
 
 def _set_source_expectations(store: ProjectStore, registry: Registry, session_id: int) -> None:
-    store.update_source_status(session_id, "mcp:cursor", "unknown", "awaiting MCP heartbeat")
-    store.update_source_status(session_id, "mcp:claude", "unknown", "awaiting MCP heartbeat")
+    for client in SUPPORTED_MCP_CLIENTS:
+        store.update_source_status(session_id, f"mcp:{client}", "unknown", "awaiting MCP heartbeat")
     store.update_source_status(session_id, "hook:claude", "unknown", "awaiting Claude hook event")
     adapters = registry.get_adapter_configs()
     if not adapters:
@@ -96,7 +127,7 @@ def _set_source_expectations(store: ProjectStore, registry: Registry, session_id
         return
     existing = []
     missing = []
-    for adapter in ("cursor", "claude"):
+    for adapter in SUPPORTED_ADAPTERS:
         path = adapters.get(adapter)
         if not path:
             continue
@@ -121,6 +152,69 @@ def _resolve_runtime_session_id(store: ProjectStore) -> int | None:
     return None
 
 
+def _build_repo_snapshot(project_path: Path) -> tuple[str, list[str]]:
+    project = normalize_path(project_path)
+
+    top_level: list[str] = []
+    try:
+        for item in sorted(project.iterdir(), key=lambda p: p.name.lower()):
+            if item.is_dir() and item.name in REPO_SNAPSHOT_EXCLUDED_DIRS:
+                continue
+            label = f"{item.name}/" if item.is_dir() else item.name
+            top_level.append(label)
+            if len(top_level) >= 12:
+                break
+    except OSError:
+        top_level = []
+
+    key_files: list[str] = []
+    for name in REPO_SNAPSHOT_KEY_FILES:
+        candidate = project / name
+        if candidate.exists() and candidate.is_file():
+            key_files.append(name)
+            if len(key_files) >= 8:
+                break
+
+    file_count = 0
+    capped = False
+    max_scan = 20000
+    try:
+        for root, dirs, files in os.walk(project):
+            dirs[:] = [d for d in dirs if d not in REPO_SNAPSHOT_EXCLUDED_DIRS]
+            file_count += len(files)
+            if file_count >= max_scan:
+                file_count = max_scan
+                capped = True
+                break
+    except OSError:
+        file_count = 0
+        capped = False
+
+    top_text = ", ".join(top_level) if top_level else "(none)"
+    key_text = ", ".join(key_files) if key_files else "(none)"
+    count_text = f"{file_count}+" if capped else str(file_count)
+    summary = (
+        f"Repo snapshot ({utc_now()}): root={project}; "
+        f"top_level={top_text}; key_files={key_text}; approx_files={count_text}."
+    )
+    return summary, key_files
+
+
+def _insert_repo_snapshot(store: ProjectStore, session_id: int, project_path: Path) -> None:
+    summary, files_touched = _build_repo_snapshot(project_path)
+    try:
+        store.insert_event(
+            session_id=session_id,
+            event_type="task_status",
+            summary=summary,
+            files_touched=files_touched,
+            source="ctx:startup",
+        )
+    except Exception:
+        # Best-effort seed event: startup should continue even if snapshot storage fails.
+        return
+
+
 def cmd_init(args) -> int:
     ctx_home = default_ctx_home()
     registry = Registry(ctx_home)
@@ -134,6 +228,7 @@ def cmd_init(args) -> int:
     try:
         cursor_path = update_cursor_mcp_config(project_path, force=bool(args.force))
         claude_path = update_claude_settings(project_path, force=bool(args.force))
+        codex_path = update_codex_config(project_path, force=bool(args.force))
     except ValueError as exc:
         print(str(exc))
         return 1
@@ -144,6 +239,7 @@ def cmd_init(args) -> int:
     print(f"Initialized project integration at: {project_path}")
     print(f"Cursor MCP config: {cursor_path}")
     print(f"Claude settings: {claude_path}")
+    print(f"Codex config: {codex_path}")
     if gitignore_added:
         print("Updated .gitignore: added .context-memory/")
     else:
@@ -153,7 +249,7 @@ def cmd_init(args) -> int:
     print(f"ctx executable: {executable_state} ({executable_detail})")
     print("Next steps:")
     print(f"1. ctx start --path {project_path}")
-    print(f"2. Open Cursor/Claude in {project_path}")
+    print(f"2. Open Cursor/Claude/Codex in {project_path}")
     print(f"3. ctx status --path {project_path}")
     return 0
 
@@ -189,6 +285,7 @@ def cmd_start(args) -> int:
 
     store.set_project_metadata(args.name, "recording")
     session_id = store.create_session(args.agent)
+    _insert_repo_snapshot(store, session_id, project_path)
     _set_source_expectations(store, registry, session_id)
     pid = spawn_recorder(project_path, session_id, args.agent, ctx_home)
     registry.set_recording_state(project_path, "recording", session_id, pid)
@@ -295,6 +392,7 @@ def cmd_resume(args) -> int:
         registry.set_recording_state(project_path, "stopped", None, None)
 
     store.resume_session(int(args.session_id))
+    _insert_repo_snapshot(store, int(args.session_id), project_path)
     _set_source_expectations(store, registry, int(args.session_id))
     session_agent = target["agent"] or "auto"
     pid = spawn_recorder(project_path, int(args.session_id), session_agent, ctx_home)
@@ -470,8 +568,9 @@ def cmd_list(_args) -> int:
 
 def cmd_adapter_configure(args) -> int:
     adapter = args.adapter.lower().strip()
-    if adapter not in {"cursor", "claude"}:
-        print("Adapter must be 'cursor' or 'claude'.")
+    if adapter not in SUPPORTED_ADAPTERS:
+        choices = "', '".join(SUPPORTED_ADAPTERS)
+        print(f"Adapter must be one of '{choices}'.")
         return 1
 
     ctx_home = default_ctx_home()
@@ -534,6 +633,7 @@ def cmd_doctor(args) -> int:
 
     cursor_cfg_status, cursor_cfg_detail = inspect_cursor_mcp_config(project_path)
     claude_mcp_cfg_status, claude_mcp_cfg_detail, claude_hooks_cfg = inspect_claude_settings(project_path)
+    codex_mcp_cfg_status, codex_mcp_cfg_detail = inspect_codex_config(project_path)
     claude_hooks_cfg_status, claude_hooks_cfg_detail = claude_hooks_cfg
     exe_status, exe_detail = resolve_ctx_executable()
 
@@ -541,6 +641,7 @@ def cmd_doctor(args) -> int:
     source_rows = snapshot.get("source_status", [])
     cursor_hb = _heartbeat_from_source_rows(source_rows, "mcp:cursor")
     claude_hb = _heartbeat_from_source_rows(source_rows, "mcp:claude")
+    codex_hb = _heartbeat_from_source_rows(source_rows, "mcp:codex")
     hook_hb = _heartbeat_from_source_rows(source_rows, "hook:claude")
 
     cursor_state, cursor_detail = _merge_config_and_heartbeat(
@@ -548,6 +649,9 @@ def cmd_doctor(args) -> int:
     )
     claude_state, claude_detail = _merge_config_and_heartbeat(
         claude_mcp_cfg_status, claude_mcp_cfg_detail, claude_hb, "claude MCP"
+    )
+    codex_state, codex_detail = _merge_config_and_heartbeat(
+        codex_mcp_cfg_status, codex_mcp_cfg_detail, codex_hb, "codex MCP"
     )
     hook_state, hook_detail = _merge_config_and_heartbeat(
         claude_hooks_cfg_status, claude_hooks_cfg_detail, hook_hb, "claude hooks"
@@ -560,7 +664,7 @@ def cmd_doctor(args) -> int:
     else:
         existing = []
         missing = []
-        for adapter in ("cursor", "claude"):
+        for adapter in SUPPORTED_ADAPTERS:
             path = adapters.get(adapter)
             if not path:
                 continue
@@ -583,6 +687,7 @@ def cmd_doctor(args) -> int:
         "checks": {
             "cursor_mcp": {"status": cursor_state, "detail": cursor_detail},
             "claude_mcp": {"status": claude_state, "detail": claude_detail},
+            "codex_mcp": {"status": codex_state, "detail": codex_detail},
             "claude_hooks": {"status": hook_state, "detail": hook_detail},
             "fallback_logs": {"status": fallback_state, "detail": fallback_detail},
             "ctx_executable": {"status": exe_status, "detail": exe_detail},
@@ -593,7 +698,7 @@ def cmd_doctor(args) -> int:
         print(json.dumps(payload, indent=2, ensure_ascii=True))
     else:
         print(f"Project: {payload['project']}")
-        for key in ("cursor_mcp", "claude_mcp", "claude_hooks", "fallback_logs", "ctx_executable"):
+        for key in ("cursor_mcp", "claude_mcp", "codex_mcp", "claude_hooks", "fallback_logs", "ctx_executable"):
             row = payload["checks"][key]
             print(f"- {key}: {row['status']} - {row['detail']}")
     return 0
@@ -698,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_start = subparsers.add_parser("start", help="Start recording context for a project")
     p_start.add_argument("--name", default=None)
     p_start.add_argument("--path", default=None)
-    p_start.add_argument("--agent", default="auto", choices=["cursor", "claude", "auto"])
+    p_start.add_argument("--agent", default="auto", choices=[*SUPPORTED_MCP_CLIENTS, "auto"])
     p_start.set_defaults(func=cmd_start)
 
     p_resume = subparsers.add_parser("resume", help="Resume recording on an existing session id")
@@ -752,7 +857,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_adapter = subparsers.add_parser("adapter", help="Adapter management")
     adapter_sub = p_adapter.add_subparsers(dest="adapter_command", required=True)
     p_adapter_config = adapter_sub.add_parser("configure", help="Configure adapter source")
-    p_adapter_config.add_argument("adapter", choices=["cursor", "claude"])
+    p_adapter_config.add_argument("adapter", choices=list(SUPPORTED_ADAPTERS))
     p_adapter_config.add_argument("--log-path", required=True)
     p_adapter_config.set_defaults(func=cmd_adapter_configure)
 
