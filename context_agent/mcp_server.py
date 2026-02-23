@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .constants import EVENT_TYPES
+from .constants import EVENT_TYPES, SUPPORTED_MCP_CLIENTS
 from .project_db import ProjectStore
 from .utils import normalize_path, utc_now
 
@@ -149,7 +149,7 @@ class MCPServer:
             tool_name = arguments.get("tool_name")
             tool_result = arguments.get("tool_result")
             client = str(arguments.get("client", "unknown")).lower()
-            source = f"mcp:{client}" if client in {"cursor", "claude"} else "mcp:unknown"
+            source = f"mcp:{client}" if client in SUPPORTED_MCP_CLIENTS else "mcp:unknown"
             source_detail = arguments.get("source_detail")
             if source_detail:
                 source = f"{source}:{str(source_detail)[:40]}"
@@ -164,14 +164,15 @@ class MCPServer:
                 tool_result=str(tool_result) if tool_result else None,
                 decision_summary=summary if decision else None,
             )
-            if client in {"cursor", "claude"}:
+            if client in SUPPORTED_MCP_CLIENTS:
                 self.store.update_source_status(int(session_id), f"mcp:{client}", "available", f"heartbeat {utc_now()}")
             return self._tool_text_result({"ok": True, "event_id": event_id, "session_id": int(session_id)})
 
         if name == "start_chat_session":
             client = str(arguments.get("client", "")).strip().lower()
-            if client not in {"cursor", "claude"}:
-                raise MCPError(-32602, "client must be 'cursor' or 'claude'")
+            if client not in SUPPORTED_MCP_CLIENTS:
+                allowed = "', '".join(SUPPORTED_MCP_CLIENTS)
+                raise MCPError(-32602, f"client must be one of '{allowed}'")
             external_session_ref = arguments.get("external_session_ref")
             active = self.store.get_active_session()
             if active:
@@ -195,8 +196,9 @@ class MCPServer:
 
         if name == "ping":
             client = str(arguments.get("client", "")).strip().lower()
-            if client not in {"cursor", "claude"}:
-                raise MCPError(-32602, "client must be 'cursor' or 'claude'")
+            if client not in SUPPORTED_MCP_CLIENTS:
+                allowed = "', '".join(SUPPORTED_MCP_CLIENTS)
+                raise MCPError(-32602, f"client must be one of '{allowed}'")
             session_id = self._active_session_id()
             if session_id is not None:
                 self.store.update_source_status(session_id, f"mcp:{client}", "available", f"heartbeat {utc_now()}")
@@ -230,7 +232,12 @@ class MCPServer:
                         "tool_name": {"type": ["string", "null"]},
                         "tool_result": {"type": ["string", "null"]},
                         "source_detail": {"type": ["string", "null"]},
-                        "client": {"type": ["string", "null"]},
+                        "client": {
+                            "anyOf": [
+                                {"type": "string", "enum": list(SUPPORTED_MCP_CLIENTS)},
+                                {"type": "null"},
+                            ]
+                        },
                         "session_id": {"type": ["integer", "null"]},
                     },
                     "required": ["summary"],
@@ -242,7 +249,7 @@ class MCPServer:
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "client": {"type": "string", "enum": ["cursor", "claude"]},
+                        "client": {"type": "string", "enum": list(SUPPORTED_MCP_CLIENTS)},
                         "external_session_ref": {"type": ["string", "null"]},
                     },
                     "required": ["client"],
@@ -262,7 +269,7 @@ class MCPServer:
                 "description": "Heartbeat for MCP diagnostics.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {"client": {"type": "string", "enum": ["cursor", "claude"]}},
+                    "properties": {"client": {"type": "string", "enum": list(SUPPORTED_MCP_CLIENTS)}},
                     "required": ["client"],
                 },
             },
