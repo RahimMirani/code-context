@@ -4,7 +4,7 @@ Tech stack:
 - Python 3 CLI (`argparse`, `subprocess`, `sqlite3`)
 - Project-local SQLite memory in `.context-memory/`
 - Global registry in `~/.context-agent/registry.db` (override with `CTX_HOME`)
-- MCP stdio server for Cursor/Claude integration
+- MCP stdio server for Cursor/Claude/Codex integration
 
 ## Install globally (from GitHub)
 
@@ -50,6 +50,9 @@ In the project you want to record:
 - `ctx init`
 - `ctx start`
 
+When `ctx start` (or `ctx resume`) runs:
+- It automatically stores a repo snapshot event in context memory (root path, top-level entries, key files, approximate file count).
+
 When you want to stop recording:
 - `ctx stop`
 
@@ -62,12 +65,37 @@ Delete a session:
 What `ctx init` configures:
 - `.cursor/mcp.json`
 - `.claude/settings.local.json`
+- `.codex/config.toml`
 - `.gitignore` entry for `.context-memory/`
+
+Codex note:
+- Codex must trust the project for project-scoped `.codex/config.toml` to be loaded.
+
+## Codex MCP debug checklist
+
+If Codex is not connecting to `ctx-memory` in `AgentBay-Dashboard-V2`, run:
+
+1. Initialize integration in that exact repo:
+   - `ctx init --path /Users/aliuraishmirani/agentbay-dashboard/AgentBay-Dashboard-V2`
+2. Ensure Codex MCP server is registered:
+   - `codex mcp list`
+3. If `ctx-memory` is missing in `codex mcp list`, add it once:
+   - `codex mcp add ctx-memory -- /Users/aliuraishmirani/.local/bin/ctx mcp serve --project-path /Users/aliuraishmirani/agentbay-dashboard/AgentBay-Dashboard-V2`
+4. Start a ctx session for Codex:
+   - `ctx start --path /Users/aliuraishmirani/agentbay-dashboard/AgentBay-Dashboard-V2 --agent codex`
+5. Open (or reopen) Codex in the same repo path and send one prompt.
+6. Verify heartbeat:
+   - `ctx doctor --path /Users/aliuraishmirani/agentbay-dashboard/AgentBay-Dashboard-V2 --json`
+   - Expect `checks.codex_mcp.status` to move to `connected`.
+7. If still `awaiting MCP heartbeat`:
+   - confirm `ctx status` shows `Recording: recording`
+   - confirm Codex workspace path is exactly `/Users/aliuraishmirani/agentbay-dashboard/AgentBay-Dashboard-V2`
+   - restart Codex once, then re-check `ctx doctor`.
 
 ## Command reference
 
 Core:
-- `ctx start [--name <display_name>] [--path <project_path>] [--agent cursor|claude|auto]`
+- `ctx start [--name <display_name>] [--path <project_path>] [--agent cursor|claude|codex|auto]`
 - `ctx stop [--path <project_path>]`
 - `ctx status [--path <project_path>]`
 - `ctx where [--path <project_path>]`
@@ -82,6 +110,7 @@ Core:
 Adapters (fallback mode):
 - `ctx adapter configure cursor --log-path <path>`
 - `ctx adapter configure claude --log-path <path>`
+- `ctx adapter configure codex --log-path <path>`
 
 MCP/hook runtime:
 - `ctx mcp serve --project-path <project_path>`
@@ -180,6 +209,41 @@ Use ctx-memory MCP only to read context:
 
 For logging, use hooks only:
 - After each assistant response, write a concise summary via `ctx hook ingest` with top-level JSON field `summary` (no raw transcript).
+```
+
+## Codex policy file (recommended)
+
+Path:
+- `AGENTS.md` in your project root (Codex reads it automatically for that repo).
+
+Required:
+- Not strictly required for MCP connectivity.
+
+Recommended:
+- Add rules so Codex consistently reads and writes context events.
+
+Suggested content:
+
+```md
+Use ctx-memory MCP for this repo.
+
+At chat start:
+1. Call `ping` with `{"client":"codex"}`.
+2. Call `get_context` with `{"max_events":20,"include_effective_state":true}`.
+3. If no active session is known, call `start_chat_session` with `{"client":"codex"}`.
+
+Per turn:
+1. After user message, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "user_intent"`
+   - concise summary
+2. After assistant message, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "task_status"`
+   - concise summary
+
+Use `tool_use`, `decision_made`, `test_result`, `error_seen` when relevant.
+At handoff, append `handoff` and stop session if session id is available.
 ```
 
 ## Features
