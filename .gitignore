@@ -1,1 +1,12 @@
 *.egg-info/
+.context-memory/
+.venv/
+.mypy_cache/
+.pytest_cache/
+.idea/
+.vscode/
+.cursor/
+.claude/
+.codex/
+.gitignore
+.gitignorebuild/
