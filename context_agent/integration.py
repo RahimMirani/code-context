@@ -17,6 +17,145 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
 
 CTX_SERVER_NAME = "ctx-memory"
 CLAUDE_HOOK_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")
+RULES_MARKER_BY_TOOL = {
+    "cursor": "<!-- ctx-memory-rules:cursor -->",
+    "claude": "<!-- ctx-memory-rules:claude -->",
+    "codex": "<!-- ctx-memory-rules:codex -->",
+}
+RULES_PATTERNS_BY_TOOL = {
+    "cursor": (
+        '{"client":"cursor"}',
+        "append_event",
+        'client: "cursor"',
+    ),
+    "claude": (
+        "Use ctx-memory MCP only to read context:",
+        "ctx hook ingest",
+        "Do not use MCP for logging events.",
+    ),
+    "codex": (
+        '{"client":"codex"}',
+        "Do not search for memory.md or context files.",
+        "Use ctx-memory MCP only for context.",
+    ),
+}
+CURSOR_RULES_BLOCK = """<!-- ctx-memory-rules:cursor -->
+# Context memory policy (ctx-memory)
+
+For this repository, always use MCP server `ctx-memory` so context is shared across chats/sessions.
+
+## Session start (required)
+1. Call `ping` with `{"client":"cursor"}`.
+2. Call `get_context` with `{"max_events":20,"include_effective_state":true}`.
+3. If no active chat session is known, call `start_chat_session` with `{"client":"cursor"}`.
+
+## Per-turn logging (strictly required). It should be used every prompt.
+1. After each user message, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "user_intent"`
+   - concise summary of user ask
+   - `files_touched`: `[]` unless user directly references files
+2. After each assistant response, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "task_status"`
+   - concise summary of what answer was given, what action was taken, and next step
+   - `files_touched`: repo-relative paths changed in this turn, or `[]`
+3. Do not skip post-response logging, even for short replies.
+
+## Action logging (required)
+1. When using tools, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "tool_use"`
+   - `tool_name` and short `tool_result`
+2. When a key choice is made, call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "decision_made"`
+   - summary of decision and why
+3. When tests run or errors happen, log `test_result` / `error_seen`.
+
+## Handoff/end (required)
+1. Call `append_event` with:
+   - `client: "cursor"`
+   - `event_type: "handoff"`
+   - short summary of completed + pending work
+2. If session id is available, call `stop_chat_session`.
+
+## Constraints
+1. Never store raw prompt text or full assistant responses.
+2. Store only short factual summaries.
+3. Always include `client: "cursor"` in every `append_event` call (never `mcp:unknown`).
+4. Prefer multiple small events over one long event.
+5. If an MCP call fails, retry once and continue; do not silently skip logging.
+"""
+CLAUDE_RULES_BLOCK = """<!-- ctx-memory-rules:claude -->
+Use ctx-memory MCP only to read context:
+- At chat start, call `get_context` once.
+- Do not use MCP for logging events.
+
+For logging, use hooks only:
+- After each assistant response, write a concise summary via `ctx hook ingest` with top-level JSON field `summary` (no raw transcript).
+"""
+CODEX_RULES_BLOCK = """<!-- ctx-memory-rules:codex -->
+# Context memory policy (ctx-memory)
+
+For this repository, always use MCP server `ctx-memory` so context is shared across chats/sessions.
+Do not search for memory.md or context files.
+Use ctx-memory MCP only for context.
+First action every chat: ping + get_context (+ start_chat_session if needed).
+
+## Session start (required)
+1. Call `ping` with `{"client":"codex"}`.
+2. Call `get_context` with `{"max_events":20,"include_effective_state":true}`.
+3. If no active chat session is known, call `start_chat_session` with `{"client":"codex"}`.
+
+## Per-turn logging (strictly required). It should be used every prompt.
+1. After each user message, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "user_intent"`
+   - concise summary of user ask
+   - `files_touched`: `[]` unless user directly references files
+2. After each assistant response, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "task_status"`
+   - concise summary of what answer was given, what action was taken, and next step
+   - `files_touched`: repo-relative paths changed in this turn, or `[]`
+3. Do not skip post-response logging, even for short replies.
+
+## Action logging (required)
+1. When using tools, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "tool_use"`
+   - `tool_name` and short `tool_result`
+2. When a key choice is made, call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "decision_made"`
+   - summary of decision and why
+3. When tests run or errors happen, log `test_result` / `error_seen`.
+
+## Handoff/end (required)
+1. Call `append_event` with:
+   - `client: "codex"`
+   - `event_type: "handoff"`
+   - short summary of completed + pending work
+2. If session id is available, call `stop_chat_session`.
+
+## Constraints
+1. Never store raw prompt text or full assistant responses.
+2. Store only short factual summaries.
+3. Always include `client: "codex"` in every `append_event` call (never `mcp:unknown`).
+4. Prefer multiple small events over one long event.
+5. If an MCP call fails, retry once and continue; do not silently skip logging.
+"""
+RULES_PATH_BY_TOOL = {
+    "cursor": Path(".cursor/rules/overall.md"),
+    "claude": Path(".claude/Claude.md"),
+    "codex": Path("AGENTS.md"),
+}
+RULES_BLOCK_BY_TOOL = {
+    "cursor": CURSOR_RULES_BLOCK,
+    "claude": CLAUDE_RULES_BLOCK,
+    "codex": CODEX_RULES_BLOCK,
+}
 
 
 def _hook_command(project: Path, event: str) -> str:
@@ -362,6 +501,43 @@ def _inspect_codex_ctx_table(text: str) -> tuple[str | None, list[str] | None]:
             if parsed_items:
                 args = parsed_items
     return command, args
+
+
+def _has_required_rules(content: str, tool: str) -> bool:
+    marker = RULES_MARKER_BY_TOOL[tool]
+    if marker in content:
+        return True
+    required_patterns = RULES_PATTERNS_BY_TOOL[tool]
+    return all(pattern in content for pattern in required_patterns)
+
+
+def ensure_tool_rules(project_path: Path, tool: str) -> tuple[Path, bool]:
+    tool_name = tool.strip().lower()
+    if tool_name not in RULES_PATH_BY_TOOL:
+        allowed = ", ".join(sorted(RULES_PATH_BY_TOOL))
+        raise ValueError(f"Unsupported rules tool '{tool}'. Allowed: {allowed}")
+
+    project = normalize_path(project_path)
+    rel_path = RULES_PATH_BY_TOOL[tool_name]
+    path = project / rel_path
+    ensure_dir(path.parent)
+
+    if path.exists():
+        content = path.read_text(encoding="utf-8")
+        if _has_required_rules(content, tool_name):
+            return (path, False)
+    else:
+        content = ""
+
+    block = RULES_BLOCK_BY_TOOL[tool_name].strip() + "\n"
+    updated = content
+    if updated and not updated.endswith("\n"):
+        updated += "\n"
+    if updated.strip():
+        updated += "\n"
+    updated += block
+    path.write_text(updated, encoding="utf-8")
+    return (path, True)
 
 
 def ensure_gitignore_entry(project_path: Path, entry: str = ".context-memory/") -> bool:
