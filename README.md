@@ -66,7 +66,14 @@ What `ctx init` configures:
 - `.cursor/mcp.json`
 - `.claude/settings.local.json`
 - `.codex/config.toml`
+- `.cursor/rules/overall.md` (ctx-memory policy block)
+- `.claude/Claude.md` (ctx-memory policy block)
+- `AGENTS.md` (Codex ctx-memory policy block)
 - `.gitignore` entry for `.context-memory/`
+
+Rules behavior:
+- If a rules file exists but does not already contain the ctx-memory rules, `ctx init` appends the rules block (it does not overwrite custom content).
+- Rules are idempotent: rerunning `ctx init` does not duplicate the same ctx-memory rules block.
 
 Codex note:
 - Codex must trust the project for project-scoped `.codex/config.toml` to be loaded.
@@ -106,6 +113,7 @@ Core:
 - `ctx purge [--path <project_path>] --force` (hard delete)
 - `ctx list`
 - `ctx doctor [--path <project_path>] [--json]`
+- `ctx rules <cursor|claude|codex> [--path <project_path>]` (ensure rules for one specific tool)
 
 Adapters (fallback mode):
 - `ctx adapter configure cursor --log-path <path>`
