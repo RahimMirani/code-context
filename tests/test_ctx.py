@@ -130,6 +130,7 @@ class CtxIntegrationTests(unittest.TestCase):
         self.assertIn("ambiguous", result.stdout.lower())
 
     def test_sessions_list_and_resume(self):
+        (self.project / "README.md").write_text("# Demo\n", encoding="utf-8")
         self.run_ctx(["start", "--path", str(self.project), "--name", "resume-demo", "--agent", "auto"])
         time.sleep(0.8)
         self.run_ctx(["stop", "--path", str(self.project)])
@@ -151,6 +152,16 @@ class CtxIntegrationTests(unittest.TestCase):
         self.assertIn(f"Active session: {first_session_id}", status.stdout)
 
         self.run_ctx(["stop", "--path", str(self.project)])
+
+        db_path = self.project / ".context-memory" / "context.db"
+        with sqlite3.connect(db_path) as conn:
+            snapshots = conn.execute(
+                "SELECT summary FROM events WHERE source = 'ctx:startup' ORDER BY id ASC"
+            ).fetchall()
+            self.assertGreaterEqual(len(snapshots), 3)
+            latest = snapshots[-1][0]
+            self.assertIn("Repo snapshot", latest)
+            self.assertIn(str(self.project.resolve()), latest)
 
     def test_delete_single_session(self):
         self.run_ctx(["start", "--path", str(self.project), "--name", "delete-session", "--agent", "auto"])
@@ -262,9 +273,30 @@ class CtxIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        codex_dir = self.project / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        (codex_dir / "config.toml").write_text(
+            '\n'.join(
+                [
+                    'model = "gpt-5.3-codex"',
+                    "",
+                    '[mcp_servers."other"]',
+                    'command = "other"',
+                    "",
+                    '[mcp_servers."ctx-memory"]',
+                    'command = "ctx"',
+                    'args = ["mcp", "serve", "--project-path", "/tmp/old"]',
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
 
         out = self.run_ctx(["init", "--path", str(self.project)])
         self.assertIn("Initialized project integration", out.stdout)
+        self.assertIn("Codex config:", out.stdout)
+        out_second = self.run_ctx(["init", "--path", str(self.project)])
+        self.assertIn("Initialized project integration", out_second.stdout)
 
         cursor_cfg = json.loads((self.project / ".cursor" / "mcp.json").read_text(encoding="utf-8"))
         self.assertTrue(cursor_cfg.get("custom"))
@@ -313,7 +345,43 @@ class CtxIntegrationTests(unittest.TestCase):
         for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"):
             for entry in claude_cfg["hooks"][event]:
                 self.assertNotEqual(entry.get("type"), "command")
+
+        codex_text = (self.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('model = "gpt-5.3-codex"', codex_text)
+        self.assertIn('[mcp_servers."other"]', codex_text)
+        self.assertIn('[mcp_servers."ctx-memory"]', codex_text)
+        self.assertIn(f'--project-path", "{self.project.resolve()}"', codex_text)
+        self.assertEqual(codex_text.count('[mcp_servers."ctx-memory"]'), 1)
         self.assertIn(".context-memory/", (self.project / ".gitignore").read_text(encoding="utf-8"))
+
+    def test_init_codex_invalid_toml_force_overwrite(self):
+        codex_dir = self.project / ".codex"
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        (codex_dir / "config.toml").write_text('model = "broken\n', encoding="utf-8")
+
+        failed = self.run_ctx(["init", "--path", str(self.project)], expected=1)
+        self.assertIn("Invalid TOML", failed.stdout)
+
+        out = self.run_ctx(["init", "--path", str(self.project), "--force"])
+        self.assertIn("Initialized project integration", out.stdout)
+        codex_text = (self.project / ".codex" / "config.toml").read_text(encoding="utf-8")
+        self.assertIn('[mcp_servers."ctx-memory"]', codex_text)
+
+    def test_codex_agent_and_adapter_configuration(self):
+        log_path = self.base / "codex.log"
+        log_path.write_text("", encoding="utf-8")
+
+        cfg = self.run_ctx(["adapter", "configure", "codex", "--log-path", str(log_path)])
+        self.assertIn("Configured codex log path", cfg.stdout)
+
+        self.run_ctx(["start", "--path", str(self.project), "--name", "codex-agent", "--agent", "codex"])
+        self.run_ctx(["stop", "--path", str(self.project)])
+
+        db_path = self.project / ".context-memory" / "context.db"
+        with sqlite3.connect(db_path) as conn:
+            session = conn.execute("SELECT agent FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
+            self.assertIsNotNone(session)
+            self.assertEqual(session[0], "codex")
 
     def test_mcp_server_append_event_and_doctor(self):
         self.run_ctx(["init", "--path", str(self.project)])
@@ -341,7 +409,7 @@ class CtxIntegrationTests(unittest.TestCase):
                 proc,
                 3,
                 "tools/call",
-                {"name": "ping", "arguments": {"client": "cursor"}},
+                {"name": "ping", "arguments": {"client": "codex"}},
             )
             self._mcp_request(
                 proc,
@@ -350,7 +418,7 @@ class CtxIntegrationTests(unittest.TestCase):
                 {
                     "name": "append_event",
                     "arguments": {
-                        "client": "cursor",
+                        "client": "codex",
                         "event_type": "decision_made",
                         "summary": "Use MCP tool events for continuity.",
                         "files_touched": ["src/a.py"],
@@ -382,7 +450,17 @@ class CtxIntegrationTests(unittest.TestCase):
         payload = json.loads(doctor.stdout)
         self.assertIn("checks", payload)
         self.assertIn("cursor_mcp", payload["checks"])
+        self.assertIn("codex_mcp", payload["checks"])
+        self.assertIn(payload["checks"]["codex_mcp"]["status"], {"connected", "degraded", "unavailable"})
         self.assertIn(payload["checks"]["cursor_mcp"]["status"], {"connected", "degraded", "unavailable"})
+
+        db_path = self.project / ".context-memory" / "context.db"
+        with sqlite3.connect(db_path) as conn:
+            source = conn.execute(
+                "SELECT source FROM events WHERE source LIKE 'mcp:%' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            self.assertIsNotNone(source)
+            self.assertEqual(source[0], "mcp:codex")
 
         self.run_ctx(["stop", "--path", str(self.project)])
 
