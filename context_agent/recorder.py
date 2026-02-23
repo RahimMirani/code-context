@@ -9,7 +9,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .constants import DELETED_FILE_HASH
+from .constants import DELETED_FILE_HASH, SUPPORTED_ADAPTERS
 from .project_db import ProjectStore, StorageCapError
 from .registry import Registry
 from .utils import normalize_path
@@ -56,8 +56,8 @@ class Recorder:
 
         self.store.update_source_status(self.session_id, "git", "unknown", "awaiting first scan")
         self.store.update_source_status(self.session_id, "filesystem", "unknown", "awaiting first scan")
-        self._update_adapter_availability("cursor")
-        self._update_adapter_availability("claude")
+        for adapter in SUPPORTED_ADAPTERS:
+            self._update_adapter_availability(adapter)
 
         while not self.stop_requested:
             state = self.store.get_session_state(self.session_id)
@@ -83,8 +83,8 @@ class Recorder:
         return 0
 
     def _poll_adapters(self) -> None:
-        self._poll_adapter("cursor")
-        self._poll_adapter("claude")
+        for adapter in SUPPORTED_ADAPTERS:
+            self._poll_adapter(adapter)
 
     def _update_adapter_availability(self, adapter: str) -> None:
         adapters = self.registry.get_adapter_configs()
@@ -208,7 +208,7 @@ class Recorder:
         if lowered.startswith("user:"):
             event_type = "user_intent"
             summary = text[5:].strip()
-        elif lowered.startswith(("assistant:", "claude:", "cursor:", "agent:")):
+        elif lowered.startswith(("assistant:", "claude:", "cursor:", "codex:", "agent:")):
             event_type = "agent_plan"
             summary = text.split(":", 1)[1].strip() if ":" in text else text
         else:
