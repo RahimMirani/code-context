@@ -291,6 +291,19 @@ class CtxIntegrationTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        (self.project / ".cursor" / "rules").mkdir(parents=True, exist_ok=True)
+        (self.project / ".cursor" / "rules" / "overall.md").write_text(
+            "custom cursor content\n",
+            encoding="utf-8",
+        )
+        (self.project / ".claude" / "Claude.md").write_text(
+            "custom claude content\n",
+            encoding="utf-8",
+        )
+        (self.project / "AGENTS.md").write_text(
+            "custom codex content\n",
+            encoding="utf-8",
+        )
 
         out = self.run_ctx(["init", "--path", str(self.project)])
         self.assertIn("Initialized project integration", out.stdout)
@@ -352,6 +365,19 @@ class CtxIntegrationTests(unittest.TestCase):
         self.assertIn('[mcp_servers."ctx-memory"]', codex_text)
         self.assertIn(f'--project-path", "{self.project.resolve()}"', codex_text)
         self.assertEqual(codex_text.count('[mcp_servers."ctx-memory"]'), 1)
+        cursor_rules = (self.project / ".cursor" / "rules" / "overall.md").read_text(encoding="utf-8")
+        self.assertIn("custom cursor content", cursor_rules)
+        self.assertIn("ctx-memory-rules:cursor", cursor_rules)
+        self.assertEqual(cursor_rules.count("ctx-memory-rules:cursor"), 1)
+        claude_rules = (self.project / ".claude" / "Claude.md").read_text(encoding="utf-8")
+        self.assertIn("custom claude content", claude_rules)
+        self.assertIn("ctx-memory-rules:claude", claude_rules)
+        self.assertEqual(claude_rules.count("ctx-memory-rules:claude"), 1)
+        codex_rules = (self.project / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("custom codex content", codex_rules)
+        self.assertIn("ctx-memory-rules:codex", codex_rules)
+        self.assertIn('{"client":"codex"}', codex_rules)
+        self.assertEqual(codex_rules.count("ctx-memory-rules:codex"), 1)
         self.assertIn(".context-memory/", (self.project / ".gitignore").read_text(encoding="utf-8"))
 
     def test_init_codex_invalid_toml_force_overwrite(self):
@@ -382,6 +408,20 @@ class CtxIntegrationTests(unittest.TestCase):
             session = conn.execute("SELECT agent FROM sessions ORDER BY id DESC LIMIT 1").fetchone()
             self.assertIsNotNone(session)
             self.assertEqual(session[0], "codex")
+
+    def test_rules_command_applies_specific_tool_only(self):
+        out = self.run_ctx(["rules", "codex", "--path", str(self.project)])
+        self.assertIn("Codex rules:", out.stdout)
+        self.assertTrue((self.project / "AGENTS.md").exists())
+        self.assertFalse((self.project / ".cursor" / "rules" / "overall.md").exists())
+        self.assertFalse((self.project / ".claude" / "Claude.md").exists())
+
+        codex_rules = (self.project / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("ctx-memory-rules:codex", codex_rules)
+        self.assertIn('{"client":"codex"}', codex_rules)
+
+        out_second = self.run_ctx(["rules", "codex", "--path", str(self.project)])
+        self.assertIn("already present", out_second.stdout)
 
     def test_mcp_server_append_event_and_doctor(self):
         self.run_ctx(["init", "--path", str(self.project)])
